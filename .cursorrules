@@ -1,0 +1,12 @@
+# Cursor Rules for OpenDDIL Sensor Ingest
+
+- **Context**: This is Phase 7.1 of the OpenDDIL project. We are building a tactical sensor pipeline.
+- **Data Format**: ALL telemetry MUST be wrapped in a CloudEvents JSON envelope.
+  - Required fields: `id`, `source` (device_id), `type`, `time`, `datacontenttype` (application/json), `data`.
+- **Kafka Keys**: The Kafka Message Key MUST be the `device_id`.
+- **Libraries**: 
+  - Use `confluent_kafka` for Kafka operations.
+  - Use `rti.connextdds` for DDS operations.
+- **Resilience**: Assume DDIL (Denied, Disrupted, Intermittent, Limited) network conditions. Configure producers and pipelines with infinite retries and high timeouts.
+- **Architecture**: We use the Strangler Fig Pattern. The Redpanda Connect pipeline (`redpanda-connect.yaml`) must maintain the fan-out to both HQ Redpanda and the Legacy RabbitMQ exchange. Do not remove the RabbitMQ integration.
+- **Python Style**: Use standard PEP 8. Include type hints where applicable. Always add robust logging and error handling.
