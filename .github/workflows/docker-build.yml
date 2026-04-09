@@ -1,0 +1,26 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-dds-ingestor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build dds-ingestor
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./dds-ingestor/Dockerfile
+          push: true # Set to true and configure login step to push to registry
+          tags: openddil/dds-ingestor:latest
+          target: production
