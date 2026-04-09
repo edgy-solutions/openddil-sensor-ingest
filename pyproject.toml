@@ -9,7 +9,6 @@ description = "OpenDDIL Sensor Ingestion Gateway"
 requires-python = ">=3.11"
 dependencies = [
     "confluent-kafka[protobuf]>=2.0.0",
-    "rti-connextdds>=0.1.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
     "protobuf>=4.21.0"
