@@ -2,6 +2,7 @@ kafka:
   brokers: "localhost:9092"
   raw_topic: "raw-sensor-stream"
   tactical_topic: "tactical-events"
+  schema_registry_url: "http://localhost:8081"
 
 database:
   url: "postgresql://openddil:openddil@localhost:5432/regional_db"

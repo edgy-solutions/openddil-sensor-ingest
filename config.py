@@ -16,6 +16,7 @@ class KafkaConfig(BaseModel):
     brokers: str
     raw_topic: str
     tactical_topic: str
+    schema_registry_url: str = "http://localhost:8081"
 
 class DatabaseConfig(BaseModel):
     url: str

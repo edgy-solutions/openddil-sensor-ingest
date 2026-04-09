@@ -5,6 +5,9 @@ import datetime
 import logging
 import sys
 from confluent_kafka import Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
 import rti.connextdds as dds
 import config
 
@@ -19,6 +22,16 @@ KAFKA_BROKERS = settings.kafka.brokers
 KAFKA_TOPIC = settings.kafka.raw_topic
 DDS_DOMAIN_ID = 0
 DDS_TOPIC_NAME = "SensorData"
+
+# Initialize Schema Registry Client
+schema_registry_conf = {'url': settings.kafka.schema_registry_url}
+schema_registry_client = SchemaRegistryClient(schema_registry_conf)
+
+# Load CloudEvents Schema
+with open("cloudevents_schema.json", "r") as f:
+    schema_str = f.read()
+
+json_serializer = JSONSerializer(schema_str, schema_registry_client)
 
 def get_kafka_producer():
     """Configure and return a resilient Kafka/Redpanda producer."""
@@ -104,12 +117,19 @@ def process_sample(sample_data, producer):
         # 3. Construct the exact CloudEvents envelope
         ce_envelope = create_cloudevent(device_id, data_dict)
         
+        # Validate payload against Schema Registry
+        try:
+            serialized_payload = json_serializer(ce_envelope, SerializationContext(KAFKA_TOPIC, MessageField.VALUE))
+        except Exception as e:
+            logger.error(f"Schema validation failed. Dropping poison pill: {e}")
+            return
+        
         # 4. Publish directly to the raw-sensor-stream Redpanda topic
         # The Kafka Message Key MUST be the device_id
         producer.produce(
             topic=KAFKA_TOPIC,
             key=str(device_id).encode('utf-8'),
-            value=json.dumps(ce_envelope).encode('utf-8'),
+            value=serialized_payload,
             on_delivery=delivery_report
         )
         
