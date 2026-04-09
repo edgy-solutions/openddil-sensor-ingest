@@ -6,6 +6,7 @@ import logging
 import sys
 from confluent_kafka import Producer
 import rti.connextdds as dds
+import config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,8 +14,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dds_ingestor")
 
-KAFKA_BROKERS = "localhost:9092"
-KAFKA_TOPIC = "raw-sensor-stream"
+settings = config.load_config()
+KAFKA_BROKERS = settings.kafka.brokers
+KAFKA_TOPIC = settings.kafka.raw_topic
 DDS_DOMAIN_ID = 0
 DDS_TOPIC_NAME = "SensorData"
 
@@ -40,10 +42,17 @@ def delivery_report(err, msg):
 
 def create_cloudevent(device_id, telemetry_data):
     """
-    Constructs a standard CloudEvents JSON envelope.
+    Constructs a standard CloudEvents JSON envelope dynamically based on config.
     """
     # Determine the event type based on the data
-    event_type = telemetry_data.get("dds_type", "openddil.sensor.data")
+    dds_type = telemetry_data.get("dds_type", "temperature_sensor")
+    
+    event_type = "openddil.sensor.data"
+    for sensor in settings.sensors:
+        if sensor.dds_type == dds_type:
+            event_type = sensor.cloudevent_type
+            break
+
     if "dds_type" not in telemetry_data and "temperature" in telemetry_data:
         event_type = "openddil.sensor.temperature"
 
