@@ -6,10 +6,11 @@ import logging
 import sys
 from confluent_kafka import Producer
 from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.json_schema import JSONSerializer
+from confluent_kafka.schema_registry.protobuf import ProtobufSerializer
 from confluent_kafka.serialization import SerializationContext, MessageField
 import rti.connextdds as dds
 import config
+import cloud_event_pb2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,11 +28,7 @@ DDS_TOPIC_NAME = "SensorData"
 schema_registry_conf = {'url': settings.kafka.schema_registry_url}
 schema_registry_client = SchemaRegistryClient(schema_registry_conf)
 
-# Load CloudEvents Schema
-with open("cloudevents_schema.json", "r") as f:
-    schema_str = f.read()
-
-json_serializer = JSONSerializer(schema_str, schema_registry_client)
+protobuf_serializer = ProtobufSerializer(cloud_event_pb2.CloudEvent, schema_registry_client, {'use.deprecated.format': False})
 
 def get_kafka_producer():
     """Configure and return a resilient Kafka/Redpanda producer."""
@@ -55,7 +52,7 @@ def delivery_report(err, msg):
 
 def create_cloudevent(device_id, telemetry_data):
     """
-    Constructs a standard CloudEvents JSON envelope dynamically based on config.
+    Constructs a standard CloudEvents Protobuf envelope dynamically based on config.
     """
     # Determine the event type based on the data
     dds_type = telemetry_data.get("dds_type", "temperature_sensor")
@@ -69,14 +66,14 @@ def create_cloudevent(device_id, telemetry_data):
     if "dds_type" not in telemetry_data and "temperature" in telemetry_data:
         event_type = "openddil.sensor.temperature"
 
-    return {
-        "id": str(uuid.uuid4()),
-        "source": str(device_id),
-        "type": event_type,
-        "time": datetime.datetime.utcnow().isoformat() + "Z",
-        "datacontenttype": "application/json",
-        "data": telemetry_data
-    }
+    ce = cloud_event_pb2.CloudEvent()
+    ce.id = str(uuid.uuid4())
+    ce.source = str(device_id)
+    ce.type = event_type
+    ce.time = datetime.datetime.utcnow().isoformat() + "Z"
+    ce.datacontenttype = "application/json"
+    ce.data = json.dumps(telemetry_data).encode('utf-8')
+    return ce
 
 def extract_dictionary(dynamic_data):
     """
@@ -119,7 +116,7 @@ def process_sample(sample_data, producer):
         
         # Validate payload against Schema Registry
         try:
-            serialized_payload = json_serializer(ce_envelope, SerializationContext(KAFKA_TOPIC, MessageField.VALUE))
+            serialized_payload = protobuf_serializer(ce_envelope, SerializationContext(KAFKA_TOPIC, MessageField.VALUE))
         except Exception as e:
             logger.error(f"Schema validation failed. Dropping poison pill: {e}")
             return
