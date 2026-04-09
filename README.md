@@ -19,6 +19,9 @@ All ingestors (DDS, RabbitMQ, HTTP) MUST wrap their payloads in a CloudEvents en
 }
 ```
 
+## Configuration Engine
+The ingestion gateway is fully data-driven. Topics, broker URLs, and sensor mappings are defined dynamically in `config.yaml` and validated via Pydantic in `config.py`. Do not hardcode these values in the Python scripts.
+
 ## Running the Ingestors
 
 * **RTI DDS Ingestor:** Run `python dds_ingestor.py --domain-id 0`. This listens to the DDS mesh and wraps the payloads for Redpanda.

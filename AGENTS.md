@@ -24,6 +24,11 @@ You are an AI agent working on the `openddil-sensor-ingest` repository. This rep
    - Never break the `legacy_sensor_exchange` AMQP output in `redpanda-connect.yaml` until the migration is officially marked as complete.
    - The fan-out pattern is critical to keep both the new OpenDDIL architecture and the legacy UI functioning simultaneously.
 
-4. **Dependencies**:
+4. **Dynamic Configuration**:
+   - All topics, broker URLs, and sensor types must be dynamically loaded from `config.yaml` and validated using the Pydantic models in `config.py`.
+   - Do not hardcode topics or sensor mappings in the Python scripts.
+
+5. **Dependencies**:
    - Prefer `confluent_kafka` over `kafka-python` for performance and reliability.
    - DDS interactions must use the official `rti.connextdds` Python API.
+   - Configuration requires `pydantic` and `pyyaml`.

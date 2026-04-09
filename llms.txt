@@ -9,10 +9,13 @@ This repository (`openddil-sensor-ingest`) is Phase 7.1 of the OpenDDIL architec
 4. Provide a Strangler Fig bridge (via Redpanda Connect) to fan out processed `tactical-events` to both HQ Redpanda and a legacy RabbitMQ exchange.
 
 ## Key Files
-- `dds_ingestor.py`: Python script using `rti.connextdds` and `confluent_kafka`. Extracts `device_id`, builds CloudEvents, and publishes to Redpanda.
+- `config.yaml`: Defines broker URLs, database URLs, and maps `dds_type` to `cloudevent_type`.
+- `config.py`: Pydantic models for strict type-checking of `config.yaml`.
+- `dds_ingestor.py`: Python script using `rti.connextdds` and `confluent_kafka`. Extracts `device_id`, builds CloudEvents dynamically based on config, and publishes to Redpanda.
 - `redpanda-connect.yaml`: Benthos/Redpanda Connect pipeline. Consumes `tactical-events` and fans out to HQ Redpanda (`global-tactical-events`) and legacy RabbitMQ (`legacy_sensor_exchange`).
 
 ## Rules
+- **Configuration**: Use `config.yaml` and `config.py` (Pydantic) for all topics, URLs, and sensor mappings. No hardcoding.
 - **CloudEvents**: All payloads to `raw-sensor-stream` must be CloudEvents.
 - **Kafka Key**: Must be `device_id`.
 - **DDIL Resilience**: Infinite retries for network partitions.
