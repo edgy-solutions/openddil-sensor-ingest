@@ -45,8 +45,8 @@ WORKDIR /app
 COPY dds_ingestor.py config.py config.yaml cloudevents_schema.json /app/
 
 # Ensure all files/directories are owned by a non-root user (e.g., nobody:nogroup) and run the container as that user.
-USER nobody:nogroup
-
+# Run as non-root user
+USER nonroot:nonroot
 # Set environment variables for the virtual environment
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONPATH="/app"
