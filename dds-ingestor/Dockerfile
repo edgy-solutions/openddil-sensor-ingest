@@ -32,10 +32,14 @@ COPY . /app/
 CMD ["python", "dds_ingestor.py"]
 
 # Stage 3: Production
+FROM builder AS builder-production
+RUN rm /opt/venv/bin/python && ln -s /usr/bin/python3 /opt/venv/bin/python
+
+# Stage 4: Production
 FROM gcr.io/distroless/python3-debian12 AS production
 
 # Copy only the virtual environment (/opt/venv) from the Builder stage
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder-production /opt/venv /opt/venv
 
 # Explicitly copy all necessary non-Python shared libraries (e.g., specifically identified RTI libraries)
 # COPY --from=builder /opt/rti_connext_dds/lib /usr/lib/
