@@ -36,6 +36,11 @@ WORKDIR /app
 COPY dis_ingestor.py /app/dis_ingestor.py
 COPY fixtures /app/fixtures
 
+# DIS sidecar listens on UDP 62040 + /metrics on 8080. That is the only
+# ingestor baked into this OSS image. Customer-specific ingestors
+# (proprietary HTTP, etc.) live in the customer overlay and are mounted
+# into a container that uses THIS image at runtime — see
+# openddil-customer-bundle/docker-compose.customer.yml for the mount.
 EXPOSE 62040/udp
 EXPOSE 8080/tcp
 
