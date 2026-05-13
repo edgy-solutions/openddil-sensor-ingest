@@ -11,7 +11,12 @@ permissions:
   packages: write
 
 jobs:
-  build-dds-ingestor:
+  # Publishes ghcr.io/edgy-solutions/openddil/sensor-ingest:latest, which is
+  # what openddil-demo/docker-compose.yml references for the DIS sidecar.
+  # The image bakes only dis_ingestor.py; customer-encumbered sidecars
+  # (proprietary HTTP, etc.) live in the customer overlay and bind-mount
+  # their code into a container that reuses this image at runtime.
+  build-sensor-ingest:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -27,11 +32,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build dds-ingestor
+      - name: Build sensor-ingest
         uses: docker/build-push-action@v4
         with:
           context: .
-          file: ./dds-ingestor/Dockerfile
+          file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/dds-ingestor:latest
-          target: production
+          tags: ghcr.io/${{ github.repository_owner }}/openddil/sensor-ingest:latest

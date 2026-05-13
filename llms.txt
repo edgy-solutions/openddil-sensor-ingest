@@ -17,3 +17,16 @@ This repository (`openddil-sensor-ingest`) is Phase 7.1 of the OpenDDIL architec
 - **CloudEvents**: All payloads to `raw-sensor-stream` must be CloudEvents Protobufs.
 - **Kafka Key**: Must be `device_id`.
 - **DDIL Resilience**: Infinite retries for network partitions.
+
+## Docker Compose discipline (cross-repo)
+- Base `openddil-demo/docker-compose.yml` references
+  `image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest`. NEVER `build:` in the
+  base compose.
+- Builds + source mounts live in `openddil-demo/docker-compose.override.yml`.
+- When this repo's Dockerfile changes, publish a new image so consumers
+  without source repos still get the update.
+
+## Customer separation
+- Customer-specific sidecars (proprietary HTTP, sim-a, etc.) live in
+  `openddil-customer-bundle/sensor-ingest/` and NOT here. The OSS image
+  bakes only `dis_ingestor.py`.

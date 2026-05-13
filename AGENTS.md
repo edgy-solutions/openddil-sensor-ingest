@@ -26,3 +26,22 @@ You are an AI agent working on the `openddil-sensor-ingest` repository. This rep
    - Prefer `confluent_kafka` over `kafka-python` for performance and reliability.
    - DDS interactions must use the official `rti.connextdds` Python API.
    - Configuration requires `pydantic` and `pyyaml`.
+
+6. **Docker Compose discipline (cross-repo rule)**:
+   - When this image is consumed by `openddil-demo/docker-compose.yml`,
+     the base compose references `image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest`.
+   - The base compose MUST NOT contain a `build:` directive for this
+     service. Builds + source mounts live in
+     `openddil-demo/docker-compose.override.yml`.
+   - **When you change this repo's Dockerfile or pyproject.toml, publish
+     a new image to `ghcr.io/edgy-solutions/openddil/sensor-ingest:latest`** (or bump a
+     tag and update the demo's base compose to match) so a customer or
+     CI runner with only the base compose still gets the updated sidecar.
+
+7. **Customer-encumbered code does NOT live here**:
+   - Anything that hardcodes customer-specific JSON field names,
+     RabbitMQ exchange names, or other customer ICD details lives in
+     the sibling `openddil-customer-bundle/sensor-ingest/` directory.
+     This OSS image bakes only the DIS binary sidecar (`dis_ingestor.py`)
+     and shared infra. Customer sidecars (proprietary HTTP, etc.) are
+     bind-mounted into containers that reuse this OSS image at runtime.

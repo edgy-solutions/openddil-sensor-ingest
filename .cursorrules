@@ -11,3 +11,5 @@
 - **Resilience**: Assume DDIL (Denied, Disrupted, Intermittent, Limited) network conditions. Configure producers and pipelines with infinite retries and high timeouts.
 - **Architecture**: We use the Strangler Fig Pattern. The Redpanda Connect pipeline (`redpanda-connect.yaml`) must maintain the fan-out to both HQ Redpanda and the Legacy RabbitMQ exchange. Do not remove the RabbitMQ integration.
 - **Python Style**: Use standard PEP 8. Include type hints where applicable. Always add robust logging and error handling.
+- **Docker Compose (cross-repo rule)**: This image is referenced from `openddil-demo/docker-compose.yml` as `image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest`. NEVER add a `build:` to the demo's base compose for this service. The demo's `docker-compose.override.yml` owns the `build:` block. When this repo's Dockerfile changes, publish a new image so non-developer consumers still get the update.
+- **Customer separation**: Customer-encumbered sidecars (proprietary HTTP, customer-specific JSON shapes) live in the sibling `openddil-customer-bundle/sensor-ingest/` directory, NOT here. This OSS image bakes only DIS.
