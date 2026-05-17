@@ -61,6 +61,15 @@ KAFKA_BROKERS  = os.getenv("KAFKA_BROKERS",  "redpanda-edge:9092")
 KAFKA_TOPIC    = os.getenv("KAFKA_TOPIC",    "ingress-dis-raw")
 LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO").upper()
 
+# Origin-node provenance (ADR-0022 / ADR-0023). Stamped here, the earliest
+# point in the pipeline that knows where the DIS feed physically lands.
+# Values are deployer-assigned per the topology contract. Sensor-ingest
+# stays a pure UDP→Kafka transport — entity-range awareness is test-side
+# discipline (the harness sends entities in their assigned ranges to the
+# right UDP ports); this just stamps what the deployer told it to.
+OPENDDIL_EDGE_ID   = os.getenv("OPENDDIL_EDGE_ID",   "edge-01")
+OPENDDIL_REGION_ID = os.getenv("OPENDDIL_REGION_ID", "region-01")
+
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "8080"))
 
 KAFKA_BACKOFF_MAX_S = 60  # Maximum backoff before giving up on producer connect
@@ -223,6 +232,12 @@ def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: 
         "pdu_sequence":             0,  # PDU sequence not in opendis EntityStatePdu header
         "ingest_timestamp":         datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "_raw_size_bytes":          raw_size,
+        # Origin-node provenance — see module header. DIS-mapper Bloblang
+        # reads this and writes it to Silver Provenance.edge_id/region_id.
+        "origin_node": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
     }
 
 
