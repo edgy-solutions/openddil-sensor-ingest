@@ -44,6 +44,8 @@ import time
 
 from io import BytesIO
 
+from appearance import decode as decode_appearance
+
 from opendis.PduFactory import createPdu
 from opendis.dis7 import EntityStatePdu
 
@@ -168,6 +170,27 @@ def _on_delivery(err, msg):  # noqa: ANN001
 # ---------------------------------------------------------------------------
 # PDU → JSON extraction
 # ---------------------------------------------------------------------------
+
+def _appearance_raw(pdu) -> int:  # noqa: ANN001
+    return int(getattr(pdu, "entityAppearance", 0))
+
+
+def _appearance_decoded(pdu) -> dict:  # noqa: ANN001
+    """Named facts from the appearance field, or {} if none may be read.
+
+    The RAW bits are kept alongside deliberately: Stage 1 must not become the
+    only place the truth lives, and a future ontology entry should be able to
+    reinterpret a capture without re-ingesting it.
+    """
+    etype = pdu.entityType
+    return decode_appearance(
+        _appearance_raw(pdu),
+        kind=int(getattr(etype, "entityKind", 0)),
+        domain=int(getattr(etype, "domain", 0)),
+        site_id=int(pdu.entityID.siteID),
+    )
+
+
 def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: ANN001
     """
     Extract fields from a decoded EntityStatePdu into the JSON structure
@@ -227,7 +250,13 @@ def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: 
             "theta": orient.theta,
             "phi":   orient.phi,
         },
-        "appearance_bits":         int(getattr(pdu, "entityAppearance", 0)),
+        "appearance_bits":         _appearance_raw(pdu),
+        # Decoded facts, ontology-driven and domain-aware. ABSENT when the
+        # source is not declared to populate appearance, when the field is
+        # all-zero (silence, not "undamaged"), or when the kind/domain has no
+        # entry. A consumer must read a missing key as NO CLAIM — never as a
+        # negative. See appearance.py for both refusals.
+        "appearance":              _appearance_decoded(pdu),
         "dead_reckoning_algorithm": int(getattr(pdu.deadReckoningParameters, "deadReckoningAlgorithm", 0)),
         "pdu_sequence":             0,  # PDU sequence not in opendis EntityStatePdu header
         "ingest_timestamp":         datetime.datetime.now(datetime.timezone.utc).isoformat(),
