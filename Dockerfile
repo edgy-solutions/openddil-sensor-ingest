@@ -33,7 +33,17 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
-COPY dis_ingestor.py /app/dis_ingestor.py
+# COPY BY GLOB, NOT BY NAME. This previously listed dis_ingestor.py
+# explicitly, which made the Dockerfile a SECOND place the module list lived
+# — and on 2026-08-19 adding appearance.py shipped an image that imported a
+# module it did not contain. The pod CrashLooped with ModuleNotFoundError on
+# a line that works locally, because the tests exercise the source tree and
+# the container exercises this COPY list.
+#
+# Caught by an upgrade rehearsal, which is the only place the two are
+# compared. ADR-0025's rule with a new instance: the tests proved the code
+# path, the image proved something else.
+COPY *.py /app/
 COPY fixtures /app/fixtures
 
 # DIS sidecar listens on UDP 62040 + /metrics on 8080. That is the only
