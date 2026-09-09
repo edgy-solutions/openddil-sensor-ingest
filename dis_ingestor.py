@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import datetime
 import json
+from http.server import ThreadingHTTPServer
 import logging
 import os
 import signal
@@ -50,7 +51,10 @@ from opendis.PduFactory import createPdu
 from opendis.dis7 import EntityStatePdu
 
 from confluent_kafka import Producer, KafkaException
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Histogram
+from prometheus_client.exposition import MetricsHandler
+
+import stall
 
 # ---------------------------------------------------------------------------
 # Configuration (environment variables with safe defaults)
@@ -165,6 +169,11 @@ def _on_delivery(err, msg):  # noqa: ANN001
     if err:
         KAFKA_PUBLISH_ERRORS.inc()
         logger.warning("Kafka delivery error: %s", err)
+        return
+    # CONFIRMED DELIVERY, not a successful produce() call. produce() enqueues
+    # locally and returns fine while the producer is disconnected, so marking
+    # progress there would report health exactly when there is none.
+    stall.note_output()
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +301,46 @@ def _stats_logger(interval_s: int = 60):
 # ---------------------------------------------------------------------------
 # Main receive loop
 # ---------------------------------------------------------------------------
+
+def _serve_http() -> None:
+    """/metrics plus /healthz/live, on the port the chart already scrapes.
+
+    Subclasses the prometheus handler rather than running a second server:
+    one port, one thing to configure, and the liveness answer comes from the
+    same process whose progress it describes.
+    """
+    class _Handler(MetricsHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/healthz/live"):
+                st = stall.state()
+                body = json.dumps(st).encode()
+                # 503 is what makes the kubelet restart this pod. A wedge that
+                # answers 200 is the failure this endpoint exists to end.
+                self.send_response(503 if st["stalled"] else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            super().do_GET()
+
+        def log_message(self, *_a):  # noqa: ANN002
+            pass  # kubelet probes every few seconds; do not narrate them
+
+    srv = ThreadingHTTPServer(("0.0.0.0", PROMETHEUS_PORT), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="metrics-health").start()
+
+
 def run():
     global _producer  # noqa: PLW0603
 
-    # Start Prometheus metrics server
-    start_http_server(PROMETHEUS_PORT)
-    logger.info("Prometheus /metrics listening on :%d", PROMETHEUS_PORT)
+    # Metrics AND the liveness endpoint on one server. The stall state lives
+    # in-process because the component already knows its own progress; see
+    # stall.py for why this gates LIVENESS rather than readiness.
+    _serve_http()
+    logger.info("Prometheus /metrics and /healthz/live listening on :%d",
+                PROMETHEUS_PORT)
 
     # Connect to Kafka (blocks until ready or shutdown)
     _producer = _build_producer()
@@ -352,6 +395,7 @@ def run():
                 continue
 
             DIS_PDUS_DECODED.inc()
+            stall.note_input()
 
             # --- Extract to JSON ---
             try:
