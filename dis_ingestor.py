@@ -381,6 +381,29 @@ def run():
                 logger.warning("Kafka producer queue full — dropping PDU %s", key)
             except KafkaException as exc:
                 KAFKA_PUBLISH_ERRORS.inc()
+                # A FATAL PRODUCER ERROR IS NOT A WARNING. librdkafka marks an
+                # error fatal when the producer instance can never publish
+                # again -- the client is dead and only a new one will do. This
+                # handler logged it at WARNING and continued the loop, so the
+                # process stayed up, kept receiving UDP, kept decoding, and
+                # published nothing. Measured on edge-01 2026-09-09: 460,181
+                # decoded, 21,264 kafka errors, pod 1/1 Running with zero
+                # restarts, three and a half hours.
+                #
+                # A PROCESS THAT CANNOT DO ITS JOB MUST SAY SO BY DYING, NOT BY
+                # COUNTING. Exiting non-zero lets Kubernetes restart it, and a
+                # crash loop is visible where a wedge is not -- that is the
+                # entire value of the fatal classification librdkafka already
+                # gives us and this code was discarding.
+                err = exc.args[0] if exc.args else None
+                if err is not None and getattr(err, "fatal", None) and err.fatal():
+                    logger.critical(
+                        "FATAL Kafka producer state (%s) — the producer cannot "
+                        "publish again. Exiting so the pod restarts; staying up "
+                        "would keep decoding into a dead client.", err)
+                    # Flush is pointless on a fatal producer and would block
+                    # the exit for its full timeout.
+                    os._exit(70)   # EX_SOFTWARE
                 logger.warning("Kafka produce error for %s: %s", key, exc)
 
     finally:
