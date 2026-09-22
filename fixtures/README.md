@@ -14,12 +14,13 @@ test suite (`openddil-demo/tests/hero_scenario_v3/`).
 ### sample_entity_state.bin
 
 - EntityID: site=1, application=1, entity=4773
-- EntityType: 1.1.225.1.3.1.0 (M1A2 SEPv3 per `openddil-contracts/ontology/dis_entity_types.yaml`)
+- EntityType: 1.1.225.1.1.18.0 (M1A2 SEPv3 per `openddil-contracts/ontology/dis_entity_types.yaml`;
+  SISO-REF-010-v37 "M1A2 SEP V3 (M1A2C)")
 - Force: friendly (1)
 - Marking: `IRON-01`
 - Provenance: serialized by `opendis==1.0` via `generate_fixtures.py`,
   verified round-trippable through `opendis.PduFactory.createPdu`
-  (2026-05-12).
+  (2026-05-12; regenerated with the SISO-REF-010-v37 tuple 2026-09-21).
 
 ### sample_fire_pdu.bin
 

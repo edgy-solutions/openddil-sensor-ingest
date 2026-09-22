@@ -40,7 +40,8 @@ def _save(data: bytes, name: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Entity State PDU — M1A2 SEPv3
-# Triplet (1,1,225,1,3,1,0) per dis_entity_types.yaml
+# Tuple (1,1,225,1,1,18,0) per dis_entity_types.yaml -- SISO-REF-010-v37
+# "M1A2 SEP V3 (M1A2C)"
 # ---------------------------------------------------------------------------
 def make_entity_state() -> bytes:
     pdu = EntityStatePdu()
@@ -60,8 +61,8 @@ def make_entity_state() -> bytes:
     pdu.entityType.domain      = 1
     pdu.entityType.country     = 225
     pdu.entityType.category    = 1
-    pdu.entityType.subcategory = 3
-    pdu.entityType.specific    = 1
+    pdu.entityType.subcategory = 1
+    pdu.entityType.specific    = 18
     pdu.entityType.extra       = 0
 
     pdu.forceId = 1
