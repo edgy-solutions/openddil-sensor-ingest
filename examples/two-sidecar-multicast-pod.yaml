@@ -1,0 +1,137 @@
+# =============================================================================
+# Two DIS sidecars in one pod, one multicast group, one site each
+# =============================================================================
+# EXAMPLE, not a deployable. Image tag, broker addresses, group, interface
+# and topics are all site facts; nothing here should be applied unchanged.
+#
+# WHY ONE POD WITH TWO CONTAINERS
+# -------------------------------
+# Containers in a pod share a network namespace, so both of these bind the
+# SAME port and both join the SAME group -- which is exactly the shape a DIS
+# exercise has. The kernel delivers a multicast datagram to every socket
+# bound to the port that has joined the group, so each container gets its
+# own copy of every PDU and DIS_SITE_ID decides which ones it publishes.
+#
+# This only works because dis_ingestor sets SO_REUSEADDR before bind when a
+# group is configured. Without it the second container to start fails to
+# bind, and a deployment that was told to ingest two sites quietly ingests
+# one.
+#
+# Separate pods work too and need no SO_REUSEADDR, at the cost of a pod and
+# a group join per site. Prefer separate pods when the sites have different
+# lifecycles or belong to different edges; prefer this when they are one
+# exercise landing on one node.
+#
+# THE HAZARD WORTH READING BEFORE YOU APPLY THIS
+# ----------------------------------------------
+# Most CNI plugins do not forward multicast into pod networks. If yours does
+# not, these containers join a group that never delivers anything and report
+# themselves perfectly healthy while ingesting nothing -- silence that looks
+# exactly like an exercise that has not started. hostNetwork below is the
+# usual answer, and its cost is that the port is a NODE-wide resource: one
+# such pod per node, and it will collide with anything else on 62040.
+#
+# Confirm delivery rather than assuming it. dis_pdus_received_total rising
+# means PDUs are arriving; if it is flat, the problem is the network, not
+# the filter, and no amount of DIS_SITE_ID tuning will change it.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dis-ingest-exercise-alpha
+  labels:
+    app.kubernetes.io/name: sensor-ingest
+    openddil.io/feed: dis-multicast
+spec:
+  # See the hazard note above. Set false only after confirming your CNI
+  # delivers multicast to pods.
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+
+  containers:
+    # -----------------------------------------------------------------------
+    - name: dis-site-1
+      image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest
+      command: ["python", "/app/dis_ingestor.py"]
+      env:
+        - name: DIS_MULTICAST_GROUP
+          value: "239.10.20.30"
+        # The interface that carries the exercise. 0.0.0.0 lets the kernel
+        # pick, which is fine on a single-homed node and a coin toss on a
+        # node with a separate management NIC -- name it explicitly there.
+        - name: DIS_MULTICAST_IFACE
+          value: "0.0.0.0"
+        - name: DIS_SITE_ID
+          value: "1"
+        - name: UDP_PORT
+          value: "62040"
+        - name: KAFKA_BROKERS
+          value: "redpanda-edge-01:9092"
+        - name: KAFKA_TOPIC
+          value: "ingress-dis-raw"
+        - name: OPENDDIL_EDGE_ID
+          value: "edge-01"
+        - name: OPENDDIL_REGION_ID
+          value: "region-east"
+        - name: PROMETHEUS_PORT
+          value: "8080"
+      ports:
+        - name: metrics
+          containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /healthz/live
+          port: 8080
+        # Minutes, not seconds: a flapping liveness probe is a worse outage
+        # than the wedge it was added to catch.
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        failureThreshold: 4
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits:   {cpu: 500m, memory: 512Mi}
+
+    # -----------------------------------------------------------------------
+    # Same group, same port, different site and a DIFFERENT TOPIC.
+    #
+    # Two sites on one topic is legal and sometimes right, but then the only
+    # record of which sidecar published what is the key, and a filter that
+    # leaks is invisible. Separate topics make a leak land somewhere it does
+    # not belong, where it can be seen.
+    - name: dis-site-2
+      image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest
+      command: ["python", "/app/dis_ingestor.py"]
+      env:
+        - name: DIS_MULTICAST_GROUP
+          value: "239.10.20.30"
+        - name: DIS_MULTICAST_IFACE
+          value: "0.0.0.0"
+        - name: DIS_SITE_ID
+          value: "2"
+        - name: UDP_PORT
+          value: "62040"
+        - name: KAFKA_BROKERS
+          value: "redpanda-edge-01:9092"
+        - name: KAFKA_TOPIC
+          value: "ingress-dis-raw-site-2"
+        - name: OPENDDIL_EDGE_ID
+          value: "edge-01"
+        - name: OPENDDIL_REGION_ID
+          value: "region-east"
+        # The metrics/liveness server binds a port, and this container shares
+        # the namespace with the one above. It MUST differ.
+        - name: PROMETHEUS_PORT
+          value: "8081"
+      ports:
+        - name: metrics
+          containerPort: 8081
+      livenessProbe:
+        httpGet:
+          path: /healthz/live
+          port: 8081
+        initialDelaySeconds: 30
+        periodSeconds: 30
+        failureThreshold: 4
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits:   {cpu: 500m, memory: 512Mi}

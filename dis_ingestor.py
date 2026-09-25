@@ -59,8 +59,37 @@ import stall
 # ---------------------------------------------------------------------------
 # Configuration (environment variables with safe defaults)
 # ---------------------------------------------------------------------------
+# UDP_HOST is the UNICAST listen address: the address this sidecar binds.
+# The default 0.0.0.0 accepts on every interface, which is right for a
+# single sidecar on a host it owns. Set it to one address when a host runs
+# more than one feed and each must land in a different sidecar -- that is
+# the unicast form of the separation a site filter does for multicast.
 UDP_HOST       = os.getenv("UDP_HOST",       "0.0.0.0")
 UDP_PORT       = int(os.getenv("UDP_PORT",   "62040"))
+
+# A DIS exercise is conventionally distributed on a multicast group, and a
+# group is not a destination the kernel delivers by default: a plain bind()
+# receives NOTHING from one until the socket has joined it. Unset means
+# unicast, which is what every existing deployment is.
+DIS_MULTICAST_GROUP = os.getenv("DIS_MULTICAST_GROUP", "").strip()
+DIS_MULTICAST_IFACE = os.getenv("DIS_MULTICAST_IFACE", "0.0.0.0").strip()
+
+# The DIS site this sidecar is responsible for, or None for "everything that
+# arrives".
+#
+# WHY THIS EXISTS. Separation used to be a property of the WIRE: each
+# sidecar had its own UDP port and the sender addressed the right one, so
+# sensor-ingest could stay a pure transport and never look at an entity id.
+# That works because a unicast port has exactly one reader. A multicast
+# group has every reader -- every sidecar joined to the exercise receives
+# every site's PDUs, and no amount of care at the sender changes that. So
+# on a multicast feed the separation cannot live on the wire, and the only
+# place left that knows which PDUs are whose is here.
+#
+# Unset is "accept everything", so existing port-separated deployments keep
+# their exact behaviour and this stays opt-in.
+_site = os.getenv("DIS_SITE_ID", "").strip()
+DIS_SITE_ID: int | None = int(_site) if _site else None
 UDP_BUFSIZE    = int(os.getenv("UDP_BUFSIZE", str(4 * 1024 * 1024)))  # 4 MB
 
 KAFKA_BROKERS  = os.getenv("KAFKA_BROKERS",  "redpanda-edge:9092")
@@ -69,10 +98,17 @@ LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO").upper()
 
 # Origin-node provenance (ADR-0022 / ADR-0023). Stamped here, the earliest
 # point in the pipeline that knows where the DIS feed physically lands.
-# Values are deployer-assigned per the topology contract. Sensor-ingest
-# stays a pure UDP→Kafka transport — entity-range awareness is test-side
-# discipline (the harness sends entities in their assigned ranges to the
-# right UDP ports); this just stamps what the deployer told it to.
+# Values are deployer-assigned per the topology contract; this just stamps
+# what the deployer told it to.
+#
+# Sensor-ingest was a pure UDP→Kafka transport, with entity separation left
+# entirely to test-side discipline: the harness sent each range to its own
+# UDP port and one port had one reader. That holds for unicast and only for
+# unicast. A DIS exercise distributed on a multicast group delivers every
+# site to every joined sidecar, so there is no addressing decision left at
+# the sender to make the separation with. DIS_SITE_ID is the smallest thing
+# that restores it -- one equality test on the site field the PDU already
+# carries, no ranges, no ontology lookup, and off unless configured.
 OPENDDIL_EDGE_ID   = os.getenv("OPENDDIL_EDGE_ID",   "edge-01")
 OPENDDIL_REGION_ID = os.getenv("OPENDDIL_REGION_ID", "region-01")
 
@@ -105,6 +141,11 @@ DIS_PDUS_DECODED = Counter(
 DIS_DECODE_ERRORS = Counter(
     "dis_decode_errors_total",
     "Total DIS PDU decode failures",
+)
+DIS_PDUS_FILTERED = Counter(
+    "dis_pdus_filtered_total",
+    "DIS PDUs decoded but not this sidecar's to publish",
+    ["reason"],
 )
 KAFKA_PUBLISH_ERRORS = Counter(
     "kafka_publish_errors_total",
@@ -352,12 +393,44 @@ def run():
     # Open UDP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFSIZE)
-    sock.bind((UDP_HOST, UDP_PORT))
+
+    if DIS_MULTICAST_GROUP:
+        # SO_REUSEADDR before bind, and it is not boilerplate here: several
+        # sidecars are MEANT to sit on one group and one port, each taking
+        # its own site. Without it the second one to start fails to bind and
+        # the deployment silently has one fewer ingester than it was told to
+        # have.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Bind the wildcard, not the group: binding the group address is
+        # accepted on Linux but not portable, and the wildcard is what lets
+        # the same container also answer a unicast probe on this port.
+        sock.bind(("0.0.0.0", UDP_PORT))
+        mreq = (socket.inet_aton(DIS_MULTICAST_GROUP)
+                + socket.inet_aton(DIS_MULTICAST_IFACE))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        logger.info(
+            "Joined multicast group %s on iface %s, listening UDP :%d "
+            "(SO_RCVBUF=%d MB)",
+            DIS_MULTICAST_GROUP, DIS_MULTICAST_IFACE, UDP_PORT,
+            UDP_BUFSIZE // (1024 * 1024),
+        )
+    else:
+        sock.bind((UDP_HOST, UDP_PORT))
+        logger.info(
+            "Listening on UDP %s:%d (unicast, SO_RCVBUF=%d MB)",
+            UDP_HOST, UDP_PORT, UDP_BUFSIZE // (1024 * 1024),
+        )
+
     sock.settimeout(1.0)  # Non-blocking so we can honour _shutdown
-    logger.info(
-        "Listening on UDP %s:%d (SO_RCVBUF=%d MB)",
-        UDP_HOST, UDP_PORT, UDP_BUFSIZE // (1024 * 1024)
-    )
+
+    # Say the scope out loud at startup. An operator reading one line of log
+    # should be able to tell a sidecar that is ignoring most of the feed on
+    # purpose from one that is not receiving it.
+    if DIS_SITE_ID is None:
+        logger.info("Site filter: OFF -- publishing every site that arrives")
+    else:
+        logger.info("Site filter: site %d ONLY -- all other sites counted "
+                    "in dis_pdus_filtered_total and dropped", DIS_SITE_ID)
 
     try:
         while not _shutdown.is_set():
@@ -395,6 +468,33 @@ def run():
                 continue
 
             DIS_PDUS_DECODED.inc()
+
+            # --- Filter: only this sidecar's site ---
+            #
+            # THE POSITION OF THIS BLOCK IS LOAD-BEARING. It sits before
+            # stall.note_input(), and moving it after would ship a restart
+            # loop.
+            #
+            # The stall condition is `input advanced AND output did not`
+            # (see stall.py). On a shared multicast group this sidecar
+            # receives every site's PDUs, so if another site is busy while
+            # ours is quiet -- a vehicle parked, a sub-exercise not yet
+            # started, an entirely ordinary state -- counting those PDUs as
+            # OUR input would make the condition true continuously: input
+            # advancing, output correctly zero. Liveness answers 503, the
+            # kubelet restarts a pod that is doing its job perfectly, and it
+            # does so every window for as long as the other site keeps
+            # talking. That is the shape stall.py's own module note warns
+            # about for relays: failing closed on an absence that was always
+            # expected, arriving dressed as a liveness probe.
+            #
+            # So a PDU for another site is not this sidecar's input. It is
+            # counted, because silently vanishing traffic is how a
+            # misconfigured DIS_SITE_ID hides, and dropped.
+            if DIS_SITE_ID is not None and int(pdu.entityID.siteID) != DIS_SITE_ID:
+                DIS_PDUS_FILTERED.labels(reason="site").inc()
+                continue
+
             stall.note_input()
 
             # --- Extract to JSON ---

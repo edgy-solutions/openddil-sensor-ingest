@@ -1,0 +1,107 @@
+# =============================================================================
+# Two sidecars, one multicast group, two sites
+# =============================================================================
+# The smallest stack that can tell a working site filter from a broken one.
+#
+# Both sidecars join the SAME group on the SAME port. That is the whole
+# point: on a multicast feed every joined listener receives every site, so
+# the only thing standing between site 2's PDUs and site 1's topic is
+# DIS_SITE_ID. If the filter regresses, this stack shows it as records on
+# the wrong topic rather than as an absence -- and an absence is the failure
+# mode this project keeps having to distinguish from correctness.
+#
+# Each sidecar publishes to its OWN topic so that a leak is unambiguous. On
+# one shared topic, "site 2 arrived" would be a claim about which producer
+# wrote it, inferred from the key. Two topics make it a fact about where it
+# landed.
+# =============================================================================
+name: mcast-site-filter
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp
+      - '1'
+      - --reserve-memory
+      - 0M
+      - --overprovisioned
+      - --node-id
+      - '0'
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    entrypoint: ["/bin/bash", "-c"]
+    # Single partition each. Ordering is irrelevant to this test, but a
+    # single partition makes "count the records" a read with no assembly.
+    command: >
+      "rpk -X brokers=redpanda:9092 topic create site1-raw -p 1 &&
+       rpk -X brokers=redpanda:9092 topic create site2-raw -p 1"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  sidecar-site-1:
+    image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest
+    command: python /app/dis_ingestor.py
+    volumes:
+      # The published image predates the site filter. Mounting the source
+      # keeps this test honest about WHICH code it is exercising.
+      - ../../dis_ingestor.py:/app/dis_ingestor.py:ro
+      - ../../stall.py:/app/stall.py:ro
+      - ../../appearance.py:/app/appearance.py:ro
+    environment:
+      DIS_MULTICAST_GROUP: 239.10.20.30
+      DIS_SITE_ID:         "1"
+      UDP_PORT:            "62040"
+      KAFKA_BROKERS:       redpanda:9092
+      KAFKA_TOPIC:         site1-raw
+      OPENDDIL_EDGE_ID:    edge-site-1
+      OPENDDIL_REGION_ID:  region-test
+      LOG_LEVEL:           INFO
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+
+  sidecar-site-2:
+    image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest
+    command: python /app/dis_ingestor.py
+    volumes:
+      - ../../dis_ingestor.py:/app/dis_ingestor.py:ro
+      - ../../stall.py:/app/stall.py:ro
+      - ../../appearance.py:/app/appearance.py:ro
+    environment:
+      DIS_MULTICAST_GROUP: 239.10.20.30
+      DIS_SITE_ID:         "2"
+      UDP_PORT:            "62040"
+      KAFKA_BROKERS:       redpanda:9092
+      KAFKA_TOPIC:         site2-raw
+      OPENDDIL_EDGE_ID:    edge-site-2
+      OPENDDIL_REGION_ID:  region-test
+      LOG_LEVEL:           INFO
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+
+  sender:
+    image: ghcr.io/edgy-solutions/openddil/sensor-ingest:latest
+    # Idle until the test execs send_pdus.py into it. It lives in the same
+    # network namespace as the sidecars, which is what makes the multicast
+    # actually traverse a bridge rather than a loopback.
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./send_pdus.py:/app/send_pdus.py:ro
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
