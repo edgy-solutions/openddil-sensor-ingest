@@ -48,7 +48,7 @@ from io import BytesIO
 from appearance import decode as decode_appearance
 
 from opendis.PduFactory import createPdu
-from opendis.dis7 import EntityStatePdu
+from opendis.dis7 import EntityStatePdu, RemoveEntityPdu
 
 from confluent_kafka import Producer, KafkaException
 from prometheus_client import Counter, Histogram
@@ -146,6 +146,18 @@ DIS_PDUS_FILTERED = Counter(
     "dis_pdus_filtered_total",
     "DIS PDUs decoded but not this sidecar's to publish",
     ["reason"],
+)
+DIS_REMOVALS_DECODED = Counter(
+    "dis_removals_decoded_total",
+    "Total Remove Entity PDUs (type 12) successfully decoded and published "
+    "(ADR-0044 slice A)",
+)
+DIS_PDUS_DROPPED_BY_TYPE = Counter(
+    "dis_pdus_dropped_by_type_total",
+    "DIS PDUs decoded but not published -- either a PDU type this sidecar "
+    "does not act on, or a Remove Entity PDU that was not a single-entity "
+    "claim",
+    ["pdu_type"],
 )
 KAFKA_PUBLISH_ERRORS = Counter(
     "kafka_publish_errors_total",
@@ -320,6 +332,81 @@ def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: 
     }
 
 
+def _is_single_entity_removal(receiving: "EntityID") -> bool:  # noqa: ANN001,F821
+    """True only when a Remove Entity PDU's receiving EntityID names exactly
+    one entity.
+
+    DIS's wildcard convention -- entity 0xFFFF meaning "all entities [of a
+    site/application]", and a wildcard site or application field extending
+    that further -- lets one Remove Entity PDU name more than one entity.
+    ADR-0044's two-column lifecycle model updates one row per signal and has
+    no fan-out for "every entity transitioned at once", so a non-single-
+    entity claim is refused here rather than guessed at. Entity 0 is also
+    refused: unassigned, never a real entity in this codebase's fixtures.
+    """
+    return not (
+        receiving.entityID in (0, 0xFFFF)
+        or receiving.siteID == 0xFFFF
+        or receiving.applicationID == 0xFFFF
+    )
+
+
+def _extract_remove_entity(pdu: "RemoveEntityPdu") -> dict:  # noqa: ANN001,F821
+    """
+    Extract fields from a decoded RemoveEntityPdu (type 12, Simulation
+    Management family, protocol family 5) into the JSON record
+    sim-dis-mapping.yaml's remove_entity branch expects (ADR-0044 slice A).
+
+    LAYOUT AND SEMANTICS CAVEAT, same shape as the one ADR-0044 gives the
+    appearance bit table: this PDU's field layout (12-byte PDU header, then
+    a 6-byte originating EntityID, then a 6-byte receiving EntityID, then a
+    4-byte requestID -- 28 bytes total) and the "the receiving entity is the
+    one being removed" semantics are taken from Open-DIS's
+    SimulationManagementFamilyPdu / RemoveEntityPdu implementation. They are
+    NOT checked against the published IEEE 1278.1 text.
+
+    Call only after _is_single_entity_removal() has confirmed the receiving
+    EntityID names exactly one entity -- that is the entity this record
+    claims removed.
+
+    NOTE ON "ingest_timestamp": not part of the record shape as first
+    specified for this slice, added here because sim-dis-mapping.yaml's
+    remove_entity branch needs a provenance.sample_time the same way the
+    Entity State branch has one ($src.ingest_timestamp) -- without it,
+    sample_time and ingest_time (the mapping's own now()) would collapse
+    into the same value, losing the sample-vs-ingest distinction ADR-0022/
+    0023 provenance already keeps everywhere else in this pipeline.
+    """
+    receiving   = pdu.receivingEntityID
+    originating = pdu.originatingEntityID
+    entity_id_urn = f"dis:{receiving.siteID}:{receiving.applicationID}:{receiving.entityID}"
+
+    return {
+        "pdu_type": "remove_entity",
+        "dis_entity_id": {
+            "site":        receiving.siteID,
+            "application": receiving.applicationID,
+            "entity":      receiving.entityID,
+        },
+        "entity_id_urn": entity_id_urn,
+        "originating_entity_id": {
+            "site":        originating.siteID,
+            "application": originating.applicationID,
+            "entity":      originating.entityID,
+        },
+        "request_id": int(pdu.requestID),
+        "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        # Same edge_id/region_id stamps _extract_entity_state puts under
+        # "origin_node" (see module header) -- named "provenance" here,
+        # not "origin_node", because this record has no other field a
+        # mapper would confuse it with.
+        "provenance": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Periodic stats logger
 # ---------------------------------------------------------------------------
@@ -457,52 +544,111 @@ def run():
             pdu_type = int(getattr(pdu, "pduType", -1))
             DIS_PDUS_RECEIVED.labels(pdu_type=str(pdu_type)).inc()
 
-            # --- Filter: only Entity State PDUs (type 1) ---
-            if pdu_type != 1:
-                logger.debug("Dropped PDU type %d from %s (not Entity State)", pdu_type, addr)
-                continue
+            # --- Filter: only PDU types this sidecar understands ---
+            # Entity State (type 1, unchanged path) and, as of ADR-0044
+            # slice A, Remove Entity (type 12). Anything else is decoded
+            # fine by opendis but is not a signal this sidecar acts on, so
+            # it is dropped and counted rather than silently discarded --
+            # dis_pdus_received_total{pdu_type=...} already saw it arrive;
+            # this counter says what happened to it next.
+            if pdu_type == 1:
+                if not isinstance(pdu, EntityStatePdu):
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("PDU type=1 but not EntityStatePdu from %s — dropping", addr)
+                    continue
 
-            if not isinstance(pdu, EntityStatePdu):
-                DIS_DECODE_ERRORS.inc()
-                logger.debug("PDU type=1 but not EntityStatePdu from %s — dropping", addr)
-                continue
+                DIS_PDUS_DECODED.inc()
 
-            DIS_PDUS_DECODED.inc()
+                # --- Filter: only this sidecar's site ---
+                #
+                # THE POSITION OF THIS BLOCK IS LOAD-BEARING. It sits before
+                # stall.note_input(), and moving it after would ship a restart
+                # loop.
+                #
+                # The stall condition is `input advanced AND output did not`
+                # (see stall.py). On a shared multicast group this sidecar
+                # receives every site's PDUs, so if another site is busy while
+                # ours is quiet -- a vehicle parked, a sub-exercise not yet
+                # started, an entirely ordinary state -- counting those PDUs as
+                # OUR input would make the condition true continuously: input
+                # advancing, output correctly zero. Liveness answers 503, the
+                # kubelet restarts a pod that is doing its job perfectly, and it
+                # does so every window for as long as the other site keeps
+                # talking. That is the shape stall.py's own module note warns
+                # about for relays: failing closed on an absence that was always
+                # expected, arriving dressed as a liveness probe.
+                #
+                # So a PDU for another site is not this sidecar's input. It is
+                # counted, because silently vanishing traffic is how a
+                # misconfigured DIS_SITE_ID hides, and dropped.
+                if DIS_SITE_ID is not None and int(pdu.entityID.siteID) != DIS_SITE_ID:
+                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                    continue
 
-            # --- Filter: only this sidecar's site ---
-            #
-            # THE POSITION OF THIS BLOCK IS LOAD-BEARING. It sits before
-            # stall.note_input(), and moving it after would ship a restart
-            # loop.
-            #
-            # The stall condition is `input advanced AND output did not`
-            # (see stall.py). On a shared multicast group this sidecar
-            # receives every site's PDUs, so if another site is busy while
-            # ours is quiet -- a vehicle parked, a sub-exercise not yet
-            # started, an entirely ordinary state -- counting those PDUs as
-            # OUR input would make the condition true continuously: input
-            # advancing, output correctly zero. Liveness answers 503, the
-            # kubelet restarts a pod that is doing its job perfectly, and it
-            # does so every window for as long as the other site keeps
-            # talking. That is the shape stall.py's own module note warns
-            # about for relays: failing closed on an absence that was always
-            # expected, arriving dressed as a liveness probe.
-            #
-            # So a PDU for another site is not this sidecar's input. It is
-            # counted, because silently vanishing traffic is how a
-            # misconfigured DIS_SITE_ID hides, and dropped.
-            if DIS_SITE_ID is not None and int(pdu.entityID.siteID) != DIS_SITE_ID:
-                DIS_PDUS_FILTERED.labels(reason="site").inc()
-                continue
+                stall.note_input()
 
-            stall.note_input()
+                # --- Extract to JSON ---
+                try:
+                    payload = _extract_entity_state(pdu, len(data))
+                except Exception as exc:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.warning("Field extraction error from %s: %s", addr, exc)
+                    continue
 
-            # --- Extract to JSON ---
-            try:
-                payload = _extract_entity_state(pdu, len(data))
-            except Exception as exc:
-                DIS_DECODE_ERRORS.inc()
-                logger.warning("Field extraction error from %s: %s", addr, exc)
+            elif pdu_type == 12:
+                if not isinstance(pdu, RemoveEntityPdu):
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("PDU type=12 but not RemoveEntityPdu from %s — dropping", addr)
+                    continue
+
+                # --- Not a single-entity claim: drop and count ---
+                #
+                # DIS's wildcard convention -- receiving entity 0xFFFF
+                # meaning "all entities [of a site/application]", and by
+                # extension a wildcard site or application field -- lets one
+                # Remove Entity PDU name more than one entity. ADR-0044's
+                # two-column lifecycle model updates one row per signal; it
+                # has no fan-out for "every entity transitioned at once", so
+                # rather than guess one, a non-single-entity claim is
+                # dropped and counted here. Receiving entity 0 is also
+                # refused -- EntityID 0 is unassigned, never a real entity
+                # in this codebase's fixtures.
+                if not _is_single_entity_removal(pdu.receivingEntityID):
+                    DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
+                    logger.debug(
+                        "Dropped Remove Entity PDU from %s (not a single-entity "
+                        "claim: receiving=%d:%d:%d)", addr,
+                        pdu.receivingEntityID.siteID,
+                        pdu.receivingEntityID.applicationID,
+                        pdu.receivingEntityID.entityID,
+                    )
+                    continue
+
+                # --- Filter: only this sidecar's site ---
+                # Same rationale as the Entity State path above (see that
+                # block's comment), keyed on the RECEIVING entity's site --
+                # that is the entity being removed, so it is the entity
+                # whose site decides whether this is this sidecar's input.
+                if (DIS_SITE_ID is not None
+                        and int(pdu.receivingEntityID.siteID) != DIS_SITE_ID):
+                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                    continue
+
+                stall.note_input()
+                DIS_REMOVALS_DECODED.inc()
+
+                # --- Extract to JSON ---
+                try:
+                    payload = _extract_remove_entity(pdu)
+                except Exception as exc:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.warning("Field extraction error from %s: %s", addr, exc)
+                    continue
+
+            else:
+                DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
+                logger.debug("Dropped PDU type %d from %s (not Entity State or "
+                             "Remove Entity)", pdu_type, addr)
                 continue
 
             key = payload["entity_id_urn"]
