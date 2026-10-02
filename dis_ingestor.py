@@ -48,7 +48,7 @@ from io import BytesIO
 from appearance import decode as decode_appearance
 
 from opendis.PduFactory import createPdu
-from opendis.dis7 import EntityStatePdu, RemoveEntityPdu
+from opendis.dis7 import EntityStatePdu, RemoveEntityPdu, EventReportPdu
 
 from confluent_kafka import Producer, KafkaException
 from prometheus_client import Counter, Histogram
@@ -151,6 +151,11 @@ DIS_REMOVALS_DECODED = Counter(
     "dis_removals_decoded_total",
     "Total Remove Entity PDUs (type 12) successfully decoded and published "
     "(ADR-0044 slice A)",
+)
+DIS_EVENT_REPORTS_DECODED = Counter(
+    "dis_event_reports_decoded_total",
+    "Total Event Report PDUs (type 21) successfully decoded and published "
+    "(pure transport, no interpretation)",
 )
 DIS_PDUS_DROPPED_BY_TYPE = Counter(
     "dis_pdus_dropped_by_type_total",
@@ -408,6 +413,81 @@ def _extract_remove_entity(pdu: "RemoveEntityPdu") -> dict:  # noqa: ANN001,F821
 
 
 # ---------------------------------------------------------------------------
+# Event Report (type 21, Simulation Management family)
+# ---------------------------------------------------------------------------
+# PURE TRANSPORT. This sidecar reports what arrived; it does not interpret
+# eventType or any datum id. What those mean is configuration that lives
+# elsewhere, in a later build. dis-sim (the companion sender) follows the
+# same rule — it sends what its own schedule says and knows nothing about
+# what the event means either.
+def _event_report_site_matches(pdu: "EventReportPdu", site_id: int | None) -> bool:  # noqa: ANN001,F821
+    """True when this Event Report PDU is this sidecar's to publish.
+
+    Mirrors the Remove Entity branch's site filter, but keyed on the
+    ORIGINATING entity rather than the receiving one: Event Report has no
+    removed-entity convention to borrow receivingEntityID's "entity being
+    acted on" semantics from, and the originating entity is the one whose
+    site this sidecar is responsible for. Pulled out as its own predicate
+    (same shape as _is_single_entity_removal above) so it is unit-testable
+    without a socket.
+    """
+    return site_id is None or int(pdu.originatingEntityID.siteID) == site_id
+
+
+def _extract_event_report(pdu: "EventReportPdu") -> dict:  # noqa: ANN001,F821
+    """
+    Extract fields from a decoded EventReportPdu (type 21, Simulation
+    Management family, protocol family 5) into a transport record.
+
+    LAYOUT CAVEAT, same shape as _extract_remove_entity's: this PDU's field
+    layout (12-byte PDU header, 6-byte originating EntityID, 6-byte
+    receiving EntityID, 4-byte eventType, 4-byte padding, then the fixed/
+    variable datum records) and the datum-record encoding (variableDatum
+    Length counted in BITS, data padded out to the next 64-bit boundary)
+    are taken from Open-DIS's SimulationManagementFamilyPdu / EventReportPdu
+    / VariableDatum implementation. They are NOT checked against the
+    published IEEE 1278.1 text.
+
+    Reaches into `pdu._datums` rather than a public property: unlike its
+    sibling DataPdu/SetDataPdu, this opendis version's EventReportPdu does
+    not expose fixedDatumRecords/variableDatumRecords as properties --
+    `_datums` (single underscore, not name-mangled) is the only access this
+    library version offers.
+    """
+    originating = pdu.originatingEntityID
+    receiving = pdu.receivingEntityID
+    entity_id_urn = f"dis:{originating.siteID}:{originating.applicationID}:{originating.entityID}"
+
+    fixed_datums = {
+        str(d.fixedDatumID): int(d.fixedDatumValue)
+        for d in pdu._datums.fixedDatumRecords
+    }
+    variable_datums = {}
+    for d in pdu._datums.variableDatumRecords:
+        text = bytes(d.variableData).decode("utf-8", errors="replace").rstrip("\x00")
+        variable_datums[str(d.variableDatumID)] = text
+
+    return {
+        "pdu_type": "event_report",
+        "dis_entity_id": {
+            "site":        originating.siteID,
+            "application": originating.applicationID,
+            "entity":      originating.entityID,
+        },
+        "entity_id_urn": entity_id_urn,
+        "receiving_entity_id": {
+            "site":        receiving.siteID,
+            "application": receiving.applicationID,
+            "entity":      receiving.entityID,
+        },
+        "event_type": int(pdu.eventType),
+        "fixed_datums": fixed_datums,
+        "variable_datums": variable_datums,
+        "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Periodic stats logger
 # ---------------------------------------------------------------------------
 def _stats_logger(interval_s: int = 60):
@@ -645,10 +725,36 @@ def run():
                     logger.warning("Field extraction error from %s: %s", addr, exc)
                     continue
 
+            elif pdu_type == 21:
+                if not isinstance(pdu, EventReportPdu):
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("PDU type=21 but not EventReportPdu from %s — dropping", addr)
+                    continue
+
+                # --- Filter: only this sidecar's site ---
+                # Keyed on the ORIGINATING entity — see
+                # _event_report_site_matches's docstring for why that
+                # differs from the Remove Entity branch's receiving-entity
+                # key.
+                if not _event_report_site_matches(pdu, DIS_SITE_ID):
+                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                    continue
+
+                stall.note_input()
+                DIS_EVENT_REPORTS_DECODED.inc()
+
+                # --- Extract to JSON ---
+                try:
+                    payload = _extract_event_report(pdu)
+                except Exception as exc:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.warning("Field extraction error from %s: %s", addr, exc)
+                    continue
+
             else:
                 DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
-                logger.debug("Dropped PDU type %d from %s (not Entity State or "
-                             "Remove Entity)", pdu_type, addr)
+                logger.debug("Dropped PDU type %d from %s (not Entity State, "
+                             "Remove Entity, or Event Report)", pdu_type, addr)
                 continue
 
             key = payload["entity_id_urn"]
