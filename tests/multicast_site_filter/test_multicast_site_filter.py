@@ -23,6 +23,7 @@ written down after the fact is not a prediction.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -88,20 +89,34 @@ def metrics(service: str) -> dict[str, float]:
     return out
 
 
-def topic_keys(topic: str) -> list[str]:
-    """Every record key on a topic, or [] if it is empty.
+def topic_sites(topic: str) -> list[int]:
+    """Each record's declared `dis_entity_id.site` field, read from the
+    record VALUE.
+
+    ADR-0047: an opaque identifier (here, the DIS entity URN used as this
+    topic's record key, `dis:<site>:<application>:<entity>`) must not be
+    parsed to recover a field the producer already declared structurally.
+    dis_ingestor.py's _extract_entity_state builds `dis_entity_id: {site,
+    application, entity}` as a first-class field on the record value --
+    this reads that, instead of a `startswith("dis:<N>:")` check on the key.
 
     `-o :end` bounds the read at the log's current end. Sizing a read from
     `high_watermark - log_start` instead counts offsets rather than records
     and is wrong on any compacted topic -- a habit worth not forming."""
     r = subprocess.run(
         ["docker", "exec", cid("redpanda"), "rpk", "topic", "consume", topic,
-         "-o", ":end", "--format", "%k" + chr(10)],
+         "-o", ":end", "--format", "%v" + chr(10)],
         capture_output=True, text=True, timeout=120,
     )
     if r.returncode != 0:
         raise RuntimeError(f"consume {topic} failed: {r.stderr[:300]}")
-    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+    sites: list[int] = []
+    for ln in r.stdout.splitlines():
+        if not ln.strip():
+            continue
+        record = json.loads(ln)
+        sites.append(record["dis_entity_id"]["site"])
+    return sites
 
 
 def main() -> int:
@@ -120,7 +135,7 @@ def main() -> int:
               "   (joined to the group, so it SEES every site)")
         print(f"      dis_pdus_filtered_total(site) = {TOTAL_SENT - keep}")
         print(f"      records on {topic:<10}       = {keep}, "
-              f"every key dis:{site}:*")
+              f"every record's dis_entity_id.site == {site}")
     print(f"  site 3 ({PLAN[3]} PDU(s)) must appear on NEITHER topic. "
           "This is the red check.")
     print("=" * 74)
@@ -177,11 +192,11 @@ def main() -> int:
             m = metrics(svc)
             decoded = m.get("dis_pdus_decoded_total", 0.0)
             filtered = m.get('dis_pdus_filtered_total{reason="site"}', 0.0)
-            keys = topic_keys(topic)
+            sites = topic_sites(topic)
             want_keep = PLAN[site]
 
             print(f"  {svc}: decoded={decoded:.0f} "
-                  f"filtered={filtered:.0f} records={len(keys)}")
+                  f"filtered={filtered:.0f} records={len(sites)}")
 
             if decoded != TOTAL_SENT:
                 failures.append(
@@ -193,28 +208,30 @@ def main() -> int:
                 failures.append(
                     f"{svc} filtered {filtered:.0f}, predicted "
                     f"{TOTAL_SENT - want_keep}")
-            if len(keys) != want_keep:
+            if len(sites) != want_keep:
                 failures.append(
-                    f"{topic} holds {len(keys)} record(s), predicted "
+                    f"{topic} holds {len(sites)} record(s), predicted "
                     f"{want_keep}. Too few means the filter is eating its own "
                     "site; too many means it is not filtering.")
-            wrong = sorted({k for k in keys if not k.startswith(f"dis:{site}:")})
+            wrong = sorted({s for s in sites if s != site})
             if wrong:
                 failures.append(
-                    f"{topic} holds key(s) from another site: {wrong[:5]} -- "
-                    "the filter LEAKED, which on one shared group is the "
-                    "failure this test exists for")
+                    f"{topic} holds record(s) declaring another site: "
+                    f"{wrong[:5]} -- the filter LEAKED, which on one shared "
+                    "group is the failure this test exists for")
 
         # --- the red check, as part of the ordinary run --------------------
         print()
-        strays: list[str] = []
+        strays: list[int] = []
         for svc, (_site, topic) in SIDECARS.items():
-            strays += [k for k in topic_keys(topic) if k.startswith("dis:3:")]
+            strays += [s for s in topic_sites(topic) if s == 3]
         if strays:
             failures.append(
                 "RED CHECK FAILED: site 3 was claimed by nobody, yet "
-                f"{len(strays)} of its PDU(s) were published: {strays[:5]}")
-            print(f"  red check: site 3 leaked onto a topic -- {strays[:5]}")
+                f"{len(strays)} of its PDU(s) were published (declaring "
+                "dis_entity_id.site == 3)")
+            print("  red check: site 3 leaked onto a topic -- "
+                  f"{len(strays)} record(s)")
         else:
             print(f"  red check: all {PLAN[3]} site-3 PDU(s) landed nowhere, "
                   "as predicted")
