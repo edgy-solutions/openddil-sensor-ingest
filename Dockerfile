@@ -54,4 +54,11 @@ COPY fixtures /app/fixtures
 EXPOSE 62040/udp
 EXPOSE 8080/tcp
 
+ENV PYTHONDONTWRITEBYTECODE=1
+# No root needed from here down: every port this image binds is above 1024,
+# and the only paths it touches at runtime are /app and a mounted
+# /ontology. A pod that sets its own securityContext still wins -- this is
+# the floor, not a ceiling.
+USER 1000:1000
+
 CMD ["python", "/app/dis_ingestor.py"]
