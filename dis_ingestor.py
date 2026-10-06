@@ -48,7 +48,13 @@ from io import BytesIO
 from appearance import decode as decode_appearance
 
 from opendis.PduFactory import createPdu
-from opendis.dis7 import EntityStatePdu, RemoveEntityPdu, EventReportPdu
+from opendis.dis7 import (
+    EntityStatePdu,
+    RemoveEntityPdu,
+    EventReportPdu,
+    FirePdu,
+    DetonationPdu,
+)
 
 from confluent_kafka import Producer, KafkaException
 from prometheus_client import Counter, Histogram
@@ -157,6 +163,12 @@ DIS_EVENT_REPORTS_DECODED = Counter(
     "dis_event_reports_decoded_total",
     "Total Event Report PDUs (type 21) successfully decoded and published "
     "(pure transport, no interpretation)",
+)
+DIS_EFFECTOR_PDUS_DECODED = Counter(
+    "dis_effector_pdus_decoded_total",
+    "Total Fire/Detonation PDUs (types 2/3) successfully decoded and "
+    "published",
+    ["pdu_type"],
 )
 DIS_PDUS_DROPPED_BY_TYPE = Counter(
     "dis_pdus_dropped_by_type_total",
@@ -489,6 +501,132 @@ def _extract_event_report(pdu: "EventReportPdu") -> dict:  # noqa: ANN001,F821
 
 
 # ---------------------------------------------------------------------------
+# Fire / Detonation (types 2 / 3, Warfare family)
+# ---------------------------------------------------------------------------
+# Both PDU classes inherit WarfareFamilyPdu, which is where firingEntityID
+# and targetEntityID live. Detonation carries firingEntityID too (not just
+# explodingEntityID) -- that is what lets both PDUs be keyed and site-
+# filtered on the same field, the launcher, rather than Detonation needing
+# its own convention.
+def _entity_urn(entity_id) -> str:  # noqa: ANN001
+    return f"dis:{entity_id.siteID}:{entity_id.applicationID}:{entity_id.entityID}"
+
+
+def _entity_urn_or_none(entity_id) -> str | None:  # noqa: ANN001
+    """None at the DIS wildcard-unassigned id (0:0:0), else the urn.
+
+    Target and munition-expendable ids are optional in both PDUs -- a Fire
+    with no declared target, or one with no distinct expendable (e.g. a gun
+    round), sends 0:0:0 rather than omitting the field. Carrying that
+    through as null rather than the literal "dis:0:0:0" keeps a downstream
+    reader from mistaking "no target" for an actual entity.
+    """
+    if (int(entity_id.siteID) == 0
+            and int(entity_id.applicationID) == 0
+            and int(entity_id.entityID) == 0):
+        return None
+    return _entity_urn(entity_id)
+
+
+def _effector_site_matches(pdu, site_id: int | None) -> bool:  # noqa: ANN001
+    """True when this Fire/Detonation PDU is this sidecar's to publish.
+
+    Keyed on firingEntityID (the launcher) for BOTH PDU types, per the
+    design decision that Detonation is reported by the same site that fired
+    -- not by wherever the warhead happened to land. Same mirror-of-
+    _event_report_site_matches shape as that function and
+    _is_single_entity_removal: a standalone predicate, unit-testable
+    without a socket.
+    """
+    return site_id is None or int(pdu.firingEntityID.siteID) == site_id
+
+
+def _munition_type_dict(descriptor) -> dict:  # noqa: ANN001
+    """The DIS 7-tuple from a MunitionDescriptor.munitionType, under the
+    key names the DIS 1278.1 EntityType record uses in prose (kind, domain,
+    country, category, subcategory, specific, extra) rather than opendis's
+    own attribute spelling (entityKind) -- this is a transport record, not
+    an opendis binding leak."""
+    mt = descriptor.munitionType
+    return {
+        "kind":        int(mt.entityKind),
+        "domain":      int(mt.domain),
+        "country":     int(mt.country),
+        "category":    int(mt.category),
+        "subcategory": int(mt.subcategory),
+        "specific":    int(mt.specific),
+        "extra":       int(mt.extra),
+    }
+
+
+def _extract_fire(pdu: "FirePdu") -> dict:  # noqa: ANN001,F821
+    """
+    Extract fields from a decoded FirePdu (type 2, Warfare family) into a
+    transport record. PURE TRANSPORT, same discipline as _extract_event_
+    report: no interpretation of munitionType, warhead or fuse values --
+    those are opaque DIS codes here.
+    """
+    event = pdu.eventID
+    sim_addr = event.simulationAddress
+    descriptor = pdu.descriptor
+    loc = pdu.location
+
+    return {
+        "pdu_type": "fire",
+        "event_urn": f"dis-event:{sim_addr.site}:{sim_addr.application}:{event.eventNumber}",
+        "launcher_urn": _entity_urn(pdu.firingEntityID),
+        "target_urn": _entity_urn_or_none(pdu.targetEntityID),
+        "munition_urn": _entity_urn_or_none(pdu.munitionExpendableID),
+        "munition_type": _munition_type_dict(descriptor),
+        "quantity": int(descriptor.quantity),
+        "warhead": int(descriptor.warhead),
+        "fuse": int(descriptor.fuse),
+        "range": float(pdu.range),
+        "location": {"x": loc.x, "y": loc.y, "z": loc.z},
+        "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        # Same edge_id/region_id stamp _extract_remove_entity carries --
+        # this is the point of origin for the field, not a later Connect-
+        # layer mapping, since this process is the one that knows its own
+        # identity (the env vars below) and downstream mappings only
+        # forward what is already here.
+        "provenance": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
+    }
+
+
+def _extract_detonation(pdu: "DetonationPdu") -> dict:  # noqa: ANN001,F821
+    """
+    Extract fields from a decoded DetonationPdu (type 3, Warfare family)
+    into a transport record. `detonation_result` is carried as the raw DIS
+    enum int -- no mapping to a terminal-state vocabulary in this phase.
+    """
+    event = pdu.eventID
+    sim_addr = event.simulationAddress
+    descriptor = pdu.descriptor
+    loc = pdu.location
+
+    return {
+        "pdu_type": "detonation",
+        "event_urn": f"dis-event:{sim_addr.site}:{sim_addr.application}:{event.eventNumber}",
+        "launcher_urn": _entity_urn(pdu.firingEntityID),
+        "target_urn": _entity_urn_or_none(pdu.targetEntityID),
+        "munition_type": _munition_type_dict(descriptor),
+        "quantity": int(descriptor.quantity),
+        "warhead": int(descriptor.warhead),
+        "fuse": int(descriptor.fuse),
+        "detonation_result": int(pdu.detonationResult),
+        "location": {"x": loc.x, "y": loc.y, "z": loc.z},
+        "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "provenance": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Periodic stats logger
 # ---------------------------------------------------------------------------
 def _stats_logger(interval_s: int = 60):
@@ -682,12 +820,13 @@ def run():
             DIS_PDUS_RECEIVED.labels(pdu_type=str(pdu_type)).inc()
 
             # --- Filter: only PDU types this sidecar understands ---
-            # Entity State (type 1, unchanged path) and, as of ADR-0044
-            # slice A, Remove Entity (type 12). Anything else is decoded
-            # fine by opendis but is not a signal this sidecar acts on, so
-            # it is dropped and counted rather than silently discarded --
-            # dis_pdus_received_total{pdu_type=...} already saw it arrive;
-            # this counter says what happened to it next.
+            # Entity State (type 1, unchanged path), Remove Entity (type
+            # 12, ADR-0044 slice A), Event Report (type 21), and Fire /
+            # Detonation (types 2 / 3, effector events). Anything else is
+            # decoded fine by opendis but is not a signal this sidecar acts
+            # on, so it is dropped and counted rather than silently
+            # discarded -- dis_pdus_received_total{pdu_type=...} already
+            # saw it arrive; this counter says what happened to it next.
             if pdu_type == 1:
                 if not isinstance(pdu, EntityStatePdu):
                     DIS_DECODE_ERRORS.inc()
@@ -779,6 +918,36 @@ def run():
                     logger.warning("Field extraction error from %s: %s", addr, exc)
                     continue
 
+            elif pdu_type in (2, 3):
+                expected_cls = FirePdu if pdu_type == 2 else DetonationPdu
+                if not isinstance(pdu, expected_cls):
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("PDU type=%d but not %s from %s — dropping",
+                                 pdu_type, expected_cls.__name__, addr)
+                    continue
+
+                # --- Filter: only this sidecar's site ---
+                # Keyed on firingEntityID (the launcher) for both PDU
+                # types — see _effector_site_matches's docstring.
+                if not _effector_site_matches(pdu, DIS_SITE_ID):
+                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                    continue
+
+                stall.note_input()
+
+                # --- Extract to JSON ---
+                try:
+                    if pdu_type == 2:
+                        payload = _extract_fire(pdu)
+                    else:
+                        payload = _extract_detonation(pdu)
+                except Exception as exc:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.warning("Field extraction error from %s: %s", addr, exc)
+                    continue
+
+                DIS_EFFECTOR_PDUS_DECODED.labels(pdu_type=payload["pdu_type"]).inc()
+
             elif pdu_type == 21:
                 if not isinstance(pdu, EventReportPdu):
                     DIS_DECODE_ERRORS.inc()
@@ -808,10 +977,15 @@ def run():
             else:
                 DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
                 logger.debug("Dropped PDU type %d from %s (not Entity State, "
-                             "Remove Entity, or Event Report)", pdu_type, addr)
+                             "Remove Entity, Event Report, Fire, or "
+                             "Detonation)", pdu_type, addr)
                 continue
 
-            key = payload["entity_id_urn"]
+            # Fire/Detonation records carry launcher_urn, not entity_id_urn
+            # (an event id is never an entity id -- see event_urn's
+            # dis-event: prefix). Every other record shape keys on
+            # entity_id_urn as before.
+            key = payload.get("entity_id_urn") or payload.get("launcher_urn")
             body = json.dumps(payload, separators=(",", ":")).encode()
 
             # --- Publish to Kafka ---
