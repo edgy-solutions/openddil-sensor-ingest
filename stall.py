@@ -11,8 +11,9 @@ the wedged process runs forever — a check that appears to act and does not,
 which is this project's most-recorded failure shape wearing a Kubernetes
 object.
 
-So: readiness keeps its existing meaning ("connected to my broker"), and the
-stall condition gates liveness.
+So: the stall condition gates liveness. Readiness is a separate question,
+answered by ready.py ("am I receiving my site's entities"), and where this
+runs as a sidecar it gates the pod's Services after all -- see ready.py.
 
 WHY IN-PROCESS
 --------------

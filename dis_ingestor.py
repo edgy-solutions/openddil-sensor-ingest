@@ -54,6 +54,7 @@ from confluent_kafka import Producer, KafkaException
 from prometheus_client import Counter, Histogram
 from prometheus_client.exposition import MetricsHandler
 
+import ready
 import stall
 
 # ---------------------------------------------------------------------------
@@ -511,7 +512,8 @@ def _stats_logger(interval_s: int = 60):
 # ---------------------------------------------------------------------------
 
 def _serve_http() -> None:
-    """/metrics plus /healthz/live, on the port the chart already scrapes.
+    """/metrics plus /healthz/live and /healthz/ready, on the port the chart
+    already scrapes.
 
     Subclasses the prometheus handler rather than running a second server:
     one port, one thing to configure, and the liveness answer comes from the
@@ -530,6 +532,18 @@ def _serve_http() -> None:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/healthz/ready"):
+                rd = ready.state()
+                body = json.dumps(rd).encode()
+                # 503 here is what pulls the pod out of the Service's
+                # endpoints -- unlike /healthz/live's 503, which triggers a
+                # kubelet restart.
+                self.send_response(200 if rd["ready"] else 503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             super().do_GET()
 
         def log_message(self, *_a):  # noqa: ANN002
@@ -540,6 +554,56 @@ def _serve_http() -> None:
                      name="metrics-health").start()
 
 
+def _open_multicast_socket(group: str, iface: str, port: int, bufsize: int) -> socket.socket:
+    """Bind the wildcard and join `group`, with both reuse options set.
+
+    This sidecar runs in the same pod as a DIS simulator, both wanting the
+    same multicast group and port, no hostNetwork between them. Linux grants
+    a second bind on a port only when every socket on it sets SO_REUSEADDR,
+    or every socket sets SO_REUSEPORT and runs as the same effective uid --
+    and several sidecars are MEANT to sit on one group and one port, each
+    taking its own site, so this is not boilerplate here either way. The
+    co-located simulator may set only one of the two, not both, so this
+    process sets both itself rather than hope the other side picked the same
+    one; multicast is delivered to every bound socket regardless of which
+    mechanism let the bind through. Without either, the second process to
+    start fails to bind and the deployment silently has one fewer ingester
+    than it was told to have.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, bufsize)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Not every platform has SO_REUSEPORT (Windows does not) -- set it
+    # only where it exists rather than fail the whole bind over it.
+    if hasattr(socket, "SO_REUSEPORT"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    # Bind the wildcard, not the group: binding the group address is
+    # accepted on Linux but not portable, and the wildcard is what lets
+    # the same container also answer a unicast probe on this port.
+    sock.bind(("0.0.0.0", port))
+    mreq = socket.inet_aton(group) + socket.inet_aton(iface)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    return sock
+
+
+def _accept_entity_state(pdu: EntityStatePdu, site_id: int | None) -> bool:
+    """True when this PDU is this sidecar's to publish.
+
+    Extracted so the accept decision is callable without the socket loop
+    around it. The site filter runs first and short-circuits on a miss --
+    see the comment at the call site in run() for why that ordering is
+    load-bearing for the stall detector. Readiness takes the same signal:
+    an accepted Entity State PDU is "the simulator is alive and this
+    sidecar is seeing its own site," which is what /healthz/ready reports.
+    """
+    if site_id is not None and int(pdu.entityID.siteID) != site_id:
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    stall.note_input()
+    ready.note_entity()
+    return True
+
+
 def run():
     global _producer  # noqa: PLW0603
 
@@ -547,7 +611,7 @@ def run():
     # in-process because the component already knows its own progress; see
     # stall.py for why this gates LIVENESS rather than readiness.
     _serve_http()
-    logger.info("Prometheus /metrics and /healthz/live listening on :%d",
+    logger.info("Prometheus /metrics and /healthz/live, /healthz/ready listening on :%d",
                 PROMETHEUS_PORT)
 
     # Connect to Kafka (blocks until ready or shutdown)
@@ -558,23 +622,9 @@ def run():
     stats_thread.start()
 
     # Open UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFSIZE)
-
     if DIS_MULTICAST_GROUP:
-        # SO_REUSEADDR before bind, and it is not boilerplate here: several
-        # sidecars are MEANT to sit on one group and one port, each taking
-        # its own site. Without it the second one to start fails to bind and
-        # the deployment silently has one fewer ingester than it was told to
-        # have.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind the wildcard, not the group: binding the group address is
-        # accepted on Linux but not portable, and the wildcard is what lets
-        # the same container also answer a unicast probe on this port.
-        sock.bind(("0.0.0.0", UDP_PORT))
-        mreq = (socket.inet_aton(DIS_MULTICAST_GROUP)
-                + socket.inet_aton(DIS_MULTICAST_IFACE))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock = _open_multicast_socket(DIS_MULTICAST_GROUP, DIS_MULTICAST_IFACE,
+                                       UDP_PORT, UDP_BUFSIZE)
         logger.info(
             "Joined multicast group %s on iface %s, listening UDP :%d "
             "(SO_RCVBUF=%d MB)",
@@ -582,11 +632,18 @@ def run():
             UDP_BUFSIZE // (1024 * 1024),
         )
     else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFSIZE)
         sock.bind((UDP_HOST, UDP_PORT))
         logger.info(
             "Listening on UDP %s:%d (unicast, SO_RCVBUF=%d MB)",
             UDP_HOST, UDP_PORT, UDP_BUFSIZE // (1024 * 1024),
         )
+
+    # Readiness's start time is "the socket is open," not module import --
+    # see ready.py's note_started() for why the import-time default is only
+    # a fallback.
+    ready.note_started()
 
     sock.settimeout(1.0)  # Non-blocking so we can honour _shutdown
 
@@ -661,11 +718,8 @@ def run():
                 # So a PDU for another site is not this sidecar's input. It is
                 # counted, because silently vanishing traffic is how a
                 # misconfigured DIS_SITE_ID hides, and dropped.
-                if DIS_SITE_ID is not None and int(pdu.entityID.siteID) != DIS_SITE_ID:
-                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                if not _accept_entity_state(pdu, DIS_SITE_ID):
                     continue
-
-                stall.note_input()
 
                 # --- Extract to JSON ---
                 try:
