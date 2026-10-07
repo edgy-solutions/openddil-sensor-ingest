@@ -37,6 +37,7 @@ import json
 from http.server import ThreadingHTTPServer
 import logging
 import os
+import re
 import signal
 import socket
 import sys
@@ -99,6 +100,21 @@ _site = os.getenv("DIS_SITE_ID", "").strip()
 DIS_SITE_ID: int | None = int(_site) if _site else None
 UDP_BUFSIZE    = int(os.getenv("UDP_BUFSIZE", str(4 * 1024 * 1024)))  # 4 MB
 
+# A declared list of entity ids this sidecar admits, in the URN form this
+# ingestor already emits (dis:<site>:<app>:<entity> -- see _entity_urn and
+# _extract_entity_state's entity_id_urn field). DIS_SITE_ID answers "which
+# exercise is mine"; this answers "which entities within that exercise are
+# mine" -- the case where one DIS site spans two edges and both edges'
+# sidecars hear every entity on it (a shared multicast group, or a unicast
+# fan-out), so the site field alone can no longer tell them apart.
+#
+# Unset or empty is "accept every entity (subject to the site filter
+# above)", so existing deployments keep today's exact behaviour and this
+# stays opt-in. The actual parse happens below, once `logger` exists --
+# see _parse_admitted_entity_ids, which is why DIS_ADMITTED_ENTITY_IDS
+# itself is assigned there rather than here beside DIS_SITE_ID.
+_ENTITY_URN_RE = re.compile(r"^dis:(\d+):(\d+):(\d+)$")
+
 KAFKA_BROKERS  = os.getenv("KAFKA_BROKERS",  "redpanda-edge:9092")
 KAFKA_TOPIC    = os.getenv("KAFKA_TOPIC",    "ingress-dis-raw")
 LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO").upper()
@@ -132,6 +148,47 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("dis_ingestor")
+
+# ---------------------------------------------------------------------------
+# Entity filter (DIS_ADMITTED_ENTITY_IDS) -- parsed here, not beside
+# DIS_SITE_ID above, because a malformed list must log before refusing to
+# start, and logging needs `logger` to exist first.
+# ---------------------------------------------------------------------------
+def _parse_admitted_entity_ids(raw: str) -> frozenset[str] | None:
+    """Parse DIS_ADMITTED_ENTITY_IDS into a validated, de-duplicated set.
+
+    Comma- and/or whitespace-separated entity URNs. Empty/unset -> None,
+    meaning "no entity filter" (today's behaviour, exactly).
+
+    Fails closed: a token that doesn't match the URN shape, or one listed
+    twice, logs the offending token and exits non-zero rather than starting
+    with a filter that is wrong. Silently admitting nothing (every PDU
+    dropped, the sidecar looks dead) or silently admitting everything (the
+    split this exists to enforce never happens) are both worse than not
+    starting.
+    """
+    tokens = [t for t in re.split(r"[\s,]+", raw.strip()) if t]
+    if not tokens:
+        return None
+
+    admitted: set[str] = set()
+    for token in tokens:
+        if not _ENTITY_URN_RE.match(token):
+            logger.critical(
+                "DIS_ADMITTED_ENTITY_IDS: malformed entity id %r -- expected "
+                "dis:<site>:<app>:<entity>. Refusing to start.", token)
+            sys.exit(1)
+        if token in admitted:
+            logger.critical(
+                "DIS_ADMITTED_ENTITY_IDS: entity id %r listed twice. "
+                "Refusing to start.", token)
+            sys.exit(1)
+        admitted.add(token)
+    return frozenset(admitted)
+
+
+DIS_ADMITTED_ENTITY_IDS: frozenset[str] | None = _parse_admitted_entity_ids(
+    os.getenv("DIS_ADMITTED_ENTITY_IDS", ""))
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -528,6 +585,22 @@ def _entity_urn_or_none(entity_id) -> str | None:  # noqa: ANN001
     return _entity_urn(entity_id)
 
 
+def _entity_admitted(entity_id, admitted: frozenset[str] | None) -> bool:  # noqa: ANN001
+    """True when `entity_id` is on the declared admit list.
+
+    Same shape as the site filter: `admitted is None` (DIS_ADMITTED_ENTITY_IDS
+    unset) accepts everything, matching DIS_SITE_ID's own default. Reuses
+    _entity_urn so the comparison is against exactly the string this
+    ingestor already emits as entity_id_urn, not a second formatting of the
+    same three fields that could drift from it.
+
+    Callers key this on whichever entity field that PDU's site filter uses
+    (see each call site) -- not always `entity_id` on the PDU itself, e.g.
+    Fire/Detonation key on firingEntityID, never targetEntityID.
+    """
+    return admitted is None or _entity_urn(entity_id) in admitted
+
+
 def _effector_site_matches(pdu, site_id: int | None) -> bool:  # noqa: ANN001
     """True when this Fire/Detonation PDU is this sidecar's to publish.
 
@@ -724,21 +797,96 @@ def _open_multicast_socket(group: str, iface: str, port: int, bufsize: int) -> s
     return sock
 
 
-def _accept_entity_state(pdu: EntityStatePdu, site_id: int | None) -> bool:
+def _accept_entity_state(
+    pdu: EntityStatePdu,
+    site_id: int | None,
+    admitted: frozenset[str] | None = None,
+) -> bool:
     """True when this PDU is this sidecar's to publish.
 
     Extracted so the accept decision is callable without the socket loop
-    around it. The site filter runs first and short-circuits on a miss --
-    see the comment at the call site in run() for why that ordering is
-    load-bearing for the stall detector. Readiness takes the same signal:
-    an accepted Entity State PDU is "the simulator is alive and this
-    sidecar is seeing its own site," which is what /healthz/ready reports.
+    around it. The site filter runs first, then the entity filter, and
+    either short-circuits on a miss -- see the comment at the call site in
+    run() for why that ordering is load-bearing for the stall detector.
+    Readiness takes the same signal: an accepted Entity State PDU is "the
+    simulator is alive and this sidecar is seeing one of its own entities,"
+    which is what /healthz/ready reports.
     """
     if site_id is not None and int(pdu.entityID.siteID) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if not _entity_admitted(pdu.entityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
     stall.note_input()
     ready.note_entity()
+    return True
+
+
+def _accept_remove_entity(
+    pdu: "RemoveEntityPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this Remove Entity PDU is this sidecar's to publish.
+
+    Keyed on the RECEIVING entity -- that is the entity being removed, so
+    it is the entity whose site/admission decides whether this is this
+    sidecar's input. Same site-then-entity ordering as every other accept
+    function here; either miss increments DIS_PDUS_FILTERED and returns
+    False. Unlike _accept_entity_state, this does NOT call
+    stall.note_input() -- the call site does that itself, after a True, so
+    the ordering (before note_input()) is visible at the one place that
+    matters instead of hidden inside the predicate.
+    """
+    if site_id is not None and int(pdu.receivingEntityID.siteID) != site_id:
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if not _entity_admitted(pdu.receivingEntityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
+    return True
+
+
+def _accept_effector(
+    pdu,  # noqa: ANN001
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this Fire/Detonation PDU is this sidecar's to publish.
+
+    Keyed on firingEntityID (the launcher) for BOTH PDU types, never
+    targetEntityID -- see _effector_site_matches's docstring for why.
+    Same site-then-entity ordering and no stall.note_input() call, same as
+    _accept_remove_entity above.
+    """
+    if not _effector_site_matches(pdu, site_id):
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if not _entity_admitted(pdu.firingEntityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
+    return True
+
+
+def _accept_event_report(
+    pdu: "EventReportPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this Event Report PDU is this sidecar's to publish.
+
+    Keyed on the ORIGINATING entity -- see _event_report_site_matches's
+    docstring for why that differs from the Remove Entity branch's
+    receiving-entity key. Same site-then-entity ordering and no
+    stall.note_input() call, same as _accept_remove_entity above.
+    """
+    if not _event_report_site_matches(pdu, site_id):
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if not _entity_admitted(pdu.originatingEntityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
     return True
 
 
@@ -793,6 +941,13 @@ def run():
     else:
         logger.info("Site filter: site %d ONLY -- all other sites counted "
                     "in dis_pdus_filtered_total and dropped", DIS_SITE_ID)
+
+    if DIS_ADMITTED_ENTITY_IDS is None:
+        logger.info("Entity filter: OFF")
+    else:
+        logger.info("Entity filter: %d ids ONLY -- %s",
+                    len(DIS_ADMITTED_ENTITY_IDS),
+                    ", ".join(sorted(DIS_ADMITTED_ENTITY_IDS)))
 
     try:
         while not _shutdown.is_set():
@@ -857,7 +1012,7 @@ def run():
                 # So a PDU for another site is not this sidecar's input. It is
                 # counted, because silently vanishing traffic is how a
                 # misconfigured DIS_SITE_ID hides, and dropped.
-                if not _accept_entity_state(pdu, DIS_SITE_ID):
+                if not _accept_entity_state(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
                     continue
 
                 # --- Extract to JSON ---
@@ -897,14 +1052,15 @@ def run():
                     )
                     continue
 
-                # --- Filter: only this sidecar's site ---
+                # --- Filter: site, then declared entities ---
                 # Same rationale as the Entity State path above (see that
-                # block's comment), keyed on the RECEIVING entity's site --
-                # that is the entity being removed, so it is the entity
-                # whose site decides whether this is this sidecar's input.
-                if (DIS_SITE_ID is not None
-                        and int(pdu.receivingEntityID.siteID) != DIS_SITE_ID):
-                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                # block's comment), keyed on the RECEIVING entity -- that
+                # is the entity being removed, so it is the entity whose
+                # site/admission decides whether this is this sidecar's
+                # input. Same ordering rule as every path here: before
+                # stall.note_input(), so a Remove Entity PDU this sidecar
+                # didn't declare does not count as this sidecar's input.
+                if not _accept_remove_entity(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
                     continue
 
                 stall.note_input()
@@ -926,11 +1082,12 @@ def run():
                                  pdu_type, expected_cls.__name__, addr)
                     continue
 
-                # --- Filter: only this sidecar's site ---
+                # --- Filter: site, then declared entities ---
                 # Keyed on firingEntityID (the launcher) for both PDU
-                # types — see _effector_site_matches's docstring.
-                if not _effector_site_matches(pdu, DIS_SITE_ID):
-                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                # types, never targetEntityID -- see _effector_site_
+                # matches's docstring. Same before-stall.note_input()
+                # ordering as every path here.
+                if not _accept_effector(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
                     continue
 
                 stall.note_input()
@@ -954,13 +1111,12 @@ def run():
                     logger.debug("PDU type=21 but not EventReportPdu from %s — dropping", addr)
                     continue
 
-                # --- Filter: only this sidecar's site ---
-                # Keyed on the ORIGINATING entity — see
-                # _event_report_site_matches's docstring for why that
-                # differs from the Remove Entity branch's receiving-entity
-                # key.
-                if not _event_report_site_matches(pdu, DIS_SITE_ID):
-                    DIS_PDUS_FILTERED.labels(reason="site").inc()
+                # --- Filter: site, then declared entities ---
+                # Keyed on the ORIGINATING entity -- see _event_report_
+                # site_matches's docstring for why that differs from the
+                # Remove Entity branch's receiving-entity key. Same
+                # before-stall.note_input() ordering as every path here.
+                if not _accept_event_report(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
                     continue
 
                 stall.note_input()
