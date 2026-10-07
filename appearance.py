@@ -115,4 +115,12 @@ def decode(appearance_bits: int, kind: int, domain: int, site_id: int) -> dict[s
     if pp is not None:
         out["power_plant_on"] = bool(appearance_bits >> pp["bit"] & 1)
 
+    # "launcher raised" -- feeds the posture state machine's launcher_raised
+    # input (ADR-0044 amendment, "posture, a third column"). Land-only,
+    # same contract as firepower_kill above: absent from a domain's block
+    # means that domain has no such bit, so no key is emitted for it.
+    lch = block.get("launcher")
+    if lch is not None:
+        out["launcher_raised"] = bool(appearance_bits >> lch["bit"] & 1)
+
     return out
