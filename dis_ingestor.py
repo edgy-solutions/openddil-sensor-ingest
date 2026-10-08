@@ -40,6 +40,7 @@ import os
 import re
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
@@ -669,6 +670,65 @@ def _extract_fire(pdu: "FirePdu") -> dict:  # noqa: ANN001,F821
     }
 
 
+# ---------------------------------------------------------------------------
+# Resupply Received (type 7, Logistics family)
+# ---------------------------------------------------------------------------
+# Hand-decoded with struct: opendis's parse for this PDU raises whenever
+# supplies are present, so createPdu is never called for type 7. Layout is
+# big-endian, offsets from the start of the datagram: 12-byte header, then
+# receivingEntityID (6), supplyingEntityID (6), numberOfSupplyTypes (1),
+# padding, then n 12-byte records (8-byte EntityType + float32 quantity).
+def _id_urn(site: int, application: int, entity: int) -> str:
+    """Same string _entity_urn produces, from plain ints."""
+    return f"dis:{site}:{application}:{entity}"
+
+
+def _parse_resupply_received(data: bytes) -> dict:
+    """
+    Decode a Resupply Received PDU (type 7) into a transport record. PURE
+    TRANSPORT, same discipline as _extract_fire: supply types and
+    quantities are carried as-is. The padding width is derived from the
+    declared length (3 or 4 bytes accepted); anything else, or a datagram
+    shorter than its declared length, raises ValueError.
+    """
+    if len(data) < 25:
+        raise ValueError(f"resupply received too short: {len(data)} bytes")
+    timestamp, length = struct.unpack_from(">IH", data, 4)
+    rs, ra, re_, ss, sa, se, n = struct.unpack_from(">HHHHHHB", data, 12)
+    if len(data) < length:
+        raise ValueError(f"resupply received truncated: {len(data)} < {length}")
+    pad = length - 25 - 12 * n
+    if pad not in (3, 4):
+        raise ValueError(f"resupply received bad padding {pad} "
+                         f"(length={length}, supplies={n})")
+    supplies = []
+    off = 25 + pad
+    for _ in range(n):
+        kind, domain, country, cat, sub, spec, extra, qty = struct.unpack_from(
+            ">BBHBBBBf", data, off)
+        supplies.append({
+            "munition_type": {
+                "kind": kind, "domain": domain, "country": country,
+                "category": cat, "subcategory": sub, "specific": spec,
+                "extra": extra,
+            },
+            "quantity": float(qty),
+        })
+        off += 12
+    return {
+        "pdu_type": "resupply_received",
+        "event_urn": f"dis-resupply:{rs}:{ra}:{re_}:{timestamp}",
+        "launcher_urn": _id_urn(rs, ra, re_),
+        "supplier_urn": _id_urn(ss, sa, se),
+        "supplies": supplies,
+        "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "provenance": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
+    }
+
+
 def _extract_detonation(pdu: "DetonationPdu") -> dict:  # noqa: ANN001,F821
     """
     Extract fields from a decoded DetonationPdu (type 3, Warfare family)
@@ -869,6 +929,27 @@ def _accept_effector(
     return True
 
 
+def _accept_resupply_received(
+    payload: dict,
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this Resupply Received record is this sidecar's to publish.
+
+    Keyed on the RECEIVER (launcher_urn, the entity being refilled). Same
+    site-then-entity ordering, reasons and no stall.note_input() call as
+    _accept_effector.
+    """
+    urn = payload["launcher_urn"]
+    if site_id is not None and int(urn.split(":")[1]) != site_id:
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if admitted is not None and urn not in admitted:
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
+    return True
+
+
 def _accept_event_report(
     pdu: "EventReportPdu",  # noqa: F821
     site_id: int | None,
@@ -957,185 +1038,200 @@ def run():
                 _producer.poll(0)  # Service delivery callbacks
                 continue
 
-            # --- Decode PDU ---
-            pdu = None
-            try:
-                pdu = createPdu(data)
-            except Exception as exc:
-                DIS_DECODE_ERRORS.inc()
-                logger.debug("PDU decode error from %s: %s", addr, exc)
-                continue
-
-            if pdu is None:
-                DIS_DECODE_ERRORS.inc()
-                logger.debug("createPdu returned None for %d bytes from %s", len(data), addr)
-                continue
-
-            pdu_type = int(getattr(pdu, "pduType", -1))
-            DIS_PDUS_RECEIVED.labels(pdu_type=str(pdu_type)).inc()
-
-            # --- Filter: only PDU types this sidecar understands ---
-            # Entity State (type 1, unchanged path), Remove Entity (type
-            # 12, ADR-0044 slice A), Event Report (type 21), and Fire /
-            # Detonation (types 2 / 3, effector events). Anything else is
-            # decoded fine by opendis but is not a signal this sidecar acts
-            # on, so it is dropped and counted rather than silently
-            # discarded -- dis_pdus_received_total{pdu_type=...} already
-            # saw it arrive; this counter says what happened to it next.
-            if pdu_type == 1:
-                if not isinstance(pdu, EntityStatePdu):
-                    DIS_DECODE_ERRORS.inc()
-                    logger.debug("PDU type=1 but not EntityStatePdu from %s — dropping", addr)
-                    continue
-
-                DIS_PDUS_DECODED.inc()
-
-                # --- Filter: only this sidecar's site ---
-                #
-                # THE POSITION OF THIS BLOCK IS LOAD-BEARING. It sits before
-                # stall.note_input(), and moving it after would ship a restart
-                # loop.
-                #
-                # The stall condition is `input advanced AND output did not`
-                # (see stall.py). On a shared multicast group this sidecar
-                # receives every site's PDUs, so if another site is busy while
-                # ours is quiet -- a vehicle parked, a sub-exercise not yet
-                # started, an entirely ordinary state -- counting those PDUs as
-                # OUR input would make the condition true continuously: input
-                # advancing, output correctly zero. Liveness answers 503, the
-                # kubelet restarts a pod that is doing its job perfectly, and it
-                # does so every window for as long as the other site keeps
-                # talking. That is the shape stall.py's own module note warns
-                # about for relays: failing closed on an absence that was always
-                # expected, arriving dressed as a liveness probe.
-                #
-                # So a PDU for another site is not this sidecar's input. It is
-                # counted, because silently vanishing traffic is how a
-                # misconfigured DIS_SITE_ID hides, and dropped.
-                if not _accept_entity_state(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
-                    continue
-
-                # --- Extract to JSON ---
+            # --- Resupply Received (type 7): hand-decoded, never createPdu ---
+            if len(data) >= 12 and data[2] == 7:
+                DIS_PDUS_RECEIVED.labels(pdu_type="7").inc()
                 try:
-                    payload = _extract_entity_state(pdu, len(data))
+                    payload = _parse_resupply_received(data)
                 except Exception as exc:
                     DIS_DECODE_ERRORS.inc()
-                    logger.warning("Field extraction error from %s: %s", addr, exc)
+                    logger.debug("Resupply decode error from %s: %s", addr, exc)
                     continue
-
-            elif pdu_type == 12:
-                if not isinstance(pdu, RemoveEntityPdu):
-                    DIS_DECODE_ERRORS.inc()
-                    logger.debug("PDU type=12 but not RemoveEntityPdu from %s — dropping", addr)
+                if not _accept_resupply_received(payload, DIS_SITE_ID,
+                                                 DIS_ADMITTED_ENTITY_IDS):
                     continue
-
-                # --- Not a single-entity claim: drop and count ---
-                #
-                # DIS's wildcard convention -- receiving entity 0xFFFF
-                # meaning "all entities [of a site/application]", and by
-                # extension a wildcard site or application field -- lets one
-                # Remove Entity PDU name more than one entity. ADR-0044's
-                # two-column lifecycle model updates one row per signal; it
-                # has no fan-out for "every entity transitioned at once", so
-                # rather than guess one, a non-single-entity claim is
-                # dropped and counted here. Receiving entity 0 is also
-                # refused -- EntityID 0 is unassigned, never a real entity
-                # in this codebase's fixtures.
-                if not _is_single_entity_removal(pdu.receivingEntityID):
-                    DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
-                    logger.debug(
-                        "Dropped Remove Entity PDU from %s (not a single-entity "
-                        "claim: receiving=%d:%d:%d)", addr,
-                        pdu.receivingEntityID.siteID,
-                        pdu.receivingEntityID.applicationID,
-                        pdu.receivingEntityID.entityID,
-                    )
-                    continue
-
-                # --- Filter: site, then declared entities ---
-                # Same rationale as the Entity State path above (see that
-                # block's comment), keyed on the RECEIVING entity -- that
-                # is the entity being removed, so it is the entity whose
-                # site/admission decides whether this is this sidecar's
-                # input. Same ordering rule as every path here: before
-                # stall.note_input(), so a Remove Entity PDU this sidecar
-                # didn't declare does not count as this sidecar's input.
-                if not _accept_remove_entity(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
-                    continue
-
                 stall.note_input()
-                DIS_REMOVALS_DECODED.inc()
-
-                # --- Extract to JSON ---
-                try:
-                    payload = _extract_remove_entity(pdu)
-                except Exception as exc:
-                    DIS_DECODE_ERRORS.inc()
-                    logger.warning("Field extraction error from %s: %s", addr, exc)
-                    continue
-
-            elif pdu_type in (2, 3):
-                expected_cls = FirePdu if pdu_type == 2 else DetonationPdu
-                if not isinstance(pdu, expected_cls):
-                    DIS_DECODE_ERRORS.inc()
-                    logger.debug("PDU type=%d but not %s from %s — dropping",
-                                 pdu_type, expected_cls.__name__, addr)
-                    continue
-
-                # --- Filter: site, then declared entities ---
-                # Keyed on firingEntityID (the launcher) for both PDU
-                # types, never targetEntityID -- see _effector_site_
-                # matches's docstring. Same before-stall.note_input()
-                # ordering as every path here.
-                if not _accept_effector(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
-                    continue
-
-                stall.note_input()
-
-                # --- Extract to JSON ---
-                try:
-                    if pdu_type == 2:
-                        payload = _extract_fire(pdu)
-                    else:
-                        payload = _extract_detonation(pdu)
-                except Exception as exc:
-                    DIS_DECODE_ERRORS.inc()
-                    logger.warning("Field extraction error from %s: %s", addr, exc)
-                    continue
-
-                DIS_EFFECTOR_PDUS_DECODED.labels(pdu_type=payload["pdu_type"]).inc()
-
-            elif pdu_type == 21:
-                if not isinstance(pdu, EventReportPdu):
-                    DIS_DECODE_ERRORS.inc()
-                    logger.debug("PDU type=21 but not EventReportPdu from %s — dropping", addr)
-                    continue
-
-                # --- Filter: site, then declared entities ---
-                # Keyed on the ORIGINATING entity -- see _event_report_
-                # site_matches's docstring for why that differs from the
-                # Remove Entity branch's receiving-entity key. Same
-                # before-stall.note_input() ordering as every path here.
-                if not _accept_event_report(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
-                    continue
-
-                stall.note_input()
-                DIS_EVENT_REPORTS_DECODED.inc()
-
-                # --- Extract to JSON ---
-                try:
-                    payload = _extract_event_report(pdu)
-                except Exception as exc:
-                    DIS_DECODE_ERRORS.inc()
-                    logger.warning("Field extraction error from %s: %s", addr, exc)
-                    continue
-
+                DIS_EFFECTOR_PDUS_DECODED.labels(pdu_type="resupply_received").inc()
             else:
-                DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
-                logger.debug("Dropped PDU type %d from %s (not Entity State, "
-                             "Remove Entity, Event Report, Fire, or "
-                             "Detonation)", pdu_type, addr)
-                continue
+                # --- Decode PDU ---
+                pdu = None
+                try:
+                    pdu = createPdu(data)
+                except Exception as exc:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("PDU decode error from %s: %s", addr, exc)
+                    continue
+
+                if pdu is None:
+                    DIS_DECODE_ERRORS.inc()
+                    logger.debug("createPdu returned None for %d bytes from %s", len(data), addr)
+                    continue
+
+                pdu_type = int(getattr(pdu, "pduType", -1))
+                DIS_PDUS_RECEIVED.labels(pdu_type=str(pdu_type)).inc()
+
+                # --- Filter: only PDU types this sidecar understands ---
+                # Entity State (type 1, unchanged path), Remove Entity (type
+                # 12, ADR-0044 slice A), Event Report (type 21), and Fire /
+                # Detonation (types 2 / 3, effector events). Anything else is
+                # decoded fine by opendis but is not a signal this sidecar acts
+                # on, so it is dropped and counted rather than silently
+                # discarded -- dis_pdus_received_total{pdu_type=...} already
+                # saw it arrive; this counter says what happened to it next.
+                if pdu_type == 1:
+                    if not isinstance(pdu, EntityStatePdu):
+                        DIS_DECODE_ERRORS.inc()
+                        logger.debug("PDU type=1 but not EntityStatePdu from %s — dropping", addr)
+                        continue
+
+                    DIS_PDUS_DECODED.inc()
+
+                    # --- Filter: only this sidecar's site ---
+                    #
+                    # THE POSITION OF THIS BLOCK IS LOAD-BEARING. It sits before
+                    # stall.note_input(), and moving it after would ship a restart
+                    # loop.
+                    #
+                    # The stall condition is `input advanced AND output did not`
+                    # (see stall.py). On a shared multicast group this sidecar
+                    # receives every site's PDUs, so if another site is busy while
+                    # ours is quiet -- a vehicle parked, a sub-exercise not yet
+                    # started, an entirely ordinary state -- counting those PDUs as
+                    # OUR input would make the condition true continuously: input
+                    # advancing, output correctly zero. Liveness answers 503, the
+                    # kubelet restarts a pod that is doing its job perfectly, and it
+                    # does so every window for as long as the other site keeps
+                    # talking. That is the shape stall.py's own module note warns
+                    # about for relays: failing closed on an absence that was always
+                    # expected, arriving dressed as a liveness probe.
+                    #
+                    # So a PDU for another site is not this sidecar's input. It is
+                    # counted, because silently vanishing traffic is how a
+                    # misconfigured DIS_SITE_ID hides, and dropped.
+                    if not _accept_entity_state(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
+                        continue
+
+                    # --- Extract to JSON ---
+                    try:
+                        payload = _extract_entity_state(pdu, len(data))
+                    except Exception as exc:
+                        DIS_DECODE_ERRORS.inc()
+                        logger.warning("Field extraction error from %s: %s", addr, exc)
+                        continue
+
+                elif pdu_type == 12:
+                    if not isinstance(pdu, RemoveEntityPdu):
+                        DIS_DECODE_ERRORS.inc()
+                        logger.debug("PDU type=12 but not RemoveEntityPdu from %s — dropping", addr)
+                        continue
+
+                    # --- Not a single-entity claim: drop and count ---
+                    #
+                    # DIS's wildcard convention -- receiving entity 0xFFFF
+                    # meaning "all entities [of a site/application]", and by
+                    # extension a wildcard site or application field -- lets one
+                    # Remove Entity PDU name more than one entity. ADR-0044's
+                    # two-column lifecycle model updates one row per signal; it
+                    # has no fan-out for "every entity transitioned at once", so
+                    # rather than guess one, a non-single-entity claim is
+                    # dropped and counted here. Receiving entity 0 is also
+                    # refused -- EntityID 0 is unassigned, never a real entity
+                    # in this codebase's fixtures.
+                    if not _is_single_entity_removal(pdu.receivingEntityID):
+                        DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
+                        logger.debug(
+                            "Dropped Remove Entity PDU from %s (not a single-entity "
+                            "claim: receiving=%d:%d:%d)", addr,
+                            pdu.receivingEntityID.siteID,
+                            pdu.receivingEntityID.applicationID,
+                            pdu.receivingEntityID.entityID,
+                        )
+                        continue
+
+                    # --- Filter: site, then declared entities ---
+                    # Same rationale as the Entity State path above (see that
+                    # block's comment), keyed on the RECEIVING entity -- that
+                    # is the entity being removed, so it is the entity whose
+                    # site/admission decides whether this is this sidecar's
+                    # input. Same ordering rule as every path here: before
+                    # stall.note_input(), so a Remove Entity PDU this sidecar
+                    # didn't declare does not count as this sidecar's input.
+                    if not _accept_remove_entity(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
+                        continue
+
+                    stall.note_input()
+                    DIS_REMOVALS_DECODED.inc()
+
+                    # --- Extract to JSON ---
+                    try:
+                        payload = _extract_remove_entity(pdu)
+                    except Exception as exc:
+                        DIS_DECODE_ERRORS.inc()
+                        logger.warning("Field extraction error from %s: %s", addr, exc)
+                        continue
+
+                elif pdu_type in (2, 3):
+                    expected_cls = FirePdu if pdu_type == 2 else DetonationPdu
+                    if not isinstance(pdu, expected_cls):
+                        DIS_DECODE_ERRORS.inc()
+                        logger.debug("PDU type=%d but not %s from %s — dropping",
+                                     pdu_type, expected_cls.__name__, addr)
+                        continue
+
+                    # --- Filter: site, then declared entities ---
+                    # Keyed on firingEntityID (the launcher) for both PDU
+                    # types, never targetEntityID -- see _effector_site_
+                    # matches's docstring. Same before-stall.note_input()
+                    # ordering as every path here.
+                    if not _accept_effector(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
+                        continue
+
+                    stall.note_input()
+
+                    # --- Extract to JSON ---
+                    try:
+                        if pdu_type == 2:
+                            payload = _extract_fire(pdu)
+                        else:
+                            payload = _extract_detonation(pdu)
+                    except Exception as exc:
+                        DIS_DECODE_ERRORS.inc()
+                        logger.warning("Field extraction error from %s: %s", addr, exc)
+                        continue
+
+                    DIS_EFFECTOR_PDUS_DECODED.labels(pdu_type=payload["pdu_type"]).inc()
+
+                elif pdu_type == 21:
+                    if not isinstance(pdu, EventReportPdu):
+                        DIS_DECODE_ERRORS.inc()
+                        logger.debug("PDU type=21 but not EventReportPdu from %s — dropping", addr)
+                        continue
+
+                    # --- Filter: site, then declared entities ---
+                    # Keyed on the ORIGINATING entity -- see _event_report_
+                    # site_matches's docstring for why that differs from the
+                    # Remove Entity branch's receiving-entity key. Same
+                    # before-stall.note_input() ordering as every path here.
+                    if not _accept_event_report(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS):
+                        continue
+
+                    stall.note_input()
+                    DIS_EVENT_REPORTS_DECODED.inc()
+
+                    # --- Extract to JSON ---
+                    try:
+                        payload = _extract_event_report(pdu)
+                    except Exception as exc:
+                        DIS_DECODE_ERRORS.inc()
+                        logger.warning("Field extraction error from %s: %s", addr, exc)
+                        continue
+
+                else:
+                    DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
+                    logger.debug("Dropped PDU type %d from %s (not Entity State, "
+                                 "Remove Entity, Event Report, Fire, "
+                                 "Detonation, or Resupply Received)", pdu_type, addr)
+                    continue
 
             # Fire/Detonation records carry launcher_urn, not entity_id_urn
             # (an event id is never an entity id -- see event_urn's
