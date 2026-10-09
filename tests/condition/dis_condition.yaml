@@ -1,0 +1,99 @@
+# =============================================================================
+# DIS condition claims — ADR-0026 / ADR-0016
+# =============================================================================
+# An entity's condition can be claimed by several independent DIS sources:
+# the Entity State appearance bits, Electromagnetic Emission PDUs, and a Data
+# PDU health datum. Each source keeps its own claim and the worst wins, so a
+# consumer can say what moved an asset.
+#
+# That is why this lives in the ontology rather than in a service: the order
+# that resolves "worst", the appearance-to-level mapping, the per-type emission
+# baselines and the health thresholds are curated, declared inputs changed by
+# PR (ADR-0016). Hardcoded in the sidecar they would be invisible to review,
+# and the proto enum numbers are ordinal only, so they cannot carry the order.
+#
+# CURATION RULES (treat this file as code):
+#   - Changes require a PR with a domain expert reviewer.
+#   - No entry without a verified SISO-REF-010 / IEEE 1278.1 citation.
+#   - A source that is not declared under its populating_sources makes no
+#     claim. Silence is never read as health (ADR-0026 amendment, clause 3).
+#
+# IMPORTANT — the values below are structurally correct per IEEE 1278.1
+# conventions and MUST be verified against the current publication before
+# use against a live DIS network. Same standing caveat as dis_appearance and
+# dis_entity_types.
+#
+# =============================================================================
+
+# Worst first. Resolution takes the claim earliest in this list. The proto
+# ConditionLevel numbers are ordinal only and play no part in the ordering.
+level_order: [DESTROYED, DEACTIVATED, SENSOR_FAILED, NOT_EMITTING, CRITICAL, DEGRADED, NOMINAL]
+
+# Tie order: when several sources claim the worst level, moved_by lists them in
+# this order.
+source_order: [APPEARANCE_DAMAGE, APPEARANCE_POWER, EMISSION, DATA_HEALTH]
+
+appearance:
+  # Damage bits (see dis_appearance.yaml for the bit layout) to level.
+  # An unrecognised damage value makes no claim.
+  damage: { NONE: NOMINAL, SLIGHT: DEGRADED, MODERATE: CRITICAL, DESTROYED: DESTROYED }
+  # Power plant bit clear -> the entity is not emitting.
+  power_plant_off: NOT_EMITTING
+  # Deactivated bit set.
+  deactivated: DEACTIVATED
+  # Opt-in per populating source, keyed by DIS site id (the same keys as
+  # dis_appearance.yaml populating_sources). Once that source has sent a
+  # non-zero appearance for an entity, a later all-zero field reads as "power
+  # plant off, undamaged" instead of silence. Without it the decoder's zero
+  # guard stands: all-zero is no claim. Site 1 is the synthetic generator
+  # under our control, which sets the power-plant bit whenever it claims, so
+  # an all-zero field after a claim can only mean the plant went off.
+  zero_after_claim: { "1": true }
+
+emission:
+  # Sources declared to send Electromagnetic Emission PDUs that mean what the
+  # baselines below assume. EE is read only from declared sites.
+  populating_sources:
+    "1":
+      declared_by: "openddil (synthetic source, dis-sim)"
+      declared_on: "2026-10-08"
+      note: >-
+        Synthetic generator under our control. Emission PDUs from this
+        source describe the entity's own emitter.
+  # Keyed by DIS entity type string
+  # "kind:domain:country:category:subcategory:specific:extra".
+  # Each entry: { beams: int, erp_dbm: float, erp_tolerance_db: float,
+  #               silence_after_s: float }
+  #   - Reduced = fewer beams than `beams`, or any beam's ERP below
+  #     `erp_dbm - erp_tolerance_db` -> DEGRADED.
+  #   - Silence after the entity has been seen emitting (armed) for
+  #     `silence_after_s` -> SENSOR_FAILED. An explicit EE with zero systems or
+  #     zero beams -> SENSOR_FAILED at once.
+  #   - Silence while appearance claims NOT_EMITTING / DEACTIVATED / DESTROYED
+  #     is explained, so it claims nothing.
+  #   - Never armed, or no baseline for the type -> no claim.
+  # Ships EMPTY on purpose: baselines are per deployment and come from the
+  # deployment's ontology layer file `dis_condition_baselines.yaml` (same
+  # shape as this map), which the sidecar merges over it.
+  # Example (made-up type string, not a real platform):
+  #   "1:2:999:9:9:9:0": { beams: 4, erp_dbm: 80.0, erp_tolerance_db: 6.0, silence_after_s: 15.0 }
+  baselines: {}
+
+data_health:
+  populating_sources:
+    "1":
+      declared_by: "openddil (synthetic source, dis-sim)"
+      declared_on: "2026-10-08"
+      note: >-
+        Synthetic generator under our control. Data PDUs from this source
+        carry the health datum below.
+  # LOCALLY ASSIGNED for this exchange. This is NOT a registered datum id; an
+  # exchange agreement with a real partner supplies its own.
+  datum_id: 61000
+  scale: { min: 0, max: 100, higher_is_better: true }
+  # Value at or above degraded_below -> NOMINAL; below it -> DEGRADED; below
+  # critical_below -> CRITICAL.
+  degraded_below: 80
+  critical_below: 50
+  # A datum older than this claims nothing.
+  max_age_s: 30

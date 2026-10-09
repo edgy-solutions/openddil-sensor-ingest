@@ -64,11 +64,18 @@ def source_declared(site_id: int) -> bool:
     return str(site_id) in (_load().get("populating_sources") or {})
 
 
-def decode(appearance_bits: int, kind: int, domain: int, site_id: int) -> dict[str, Any]:
+def decode(appearance_bits: int, kind: int, domain: int, site_id: int,
+           zero_is_claim: bool = False) -> dict[str, Any]:
     """Decode appearance into named facts, or return {} if we must not.
 
     Empty dict means "no claim was read" — from an undeclared source, an
     unmapped kind/domain, or a missing table. It never means "no damage".
+
+    `zero_is_claim` is the per-entity opt-in from dis_condition.yaml
+    (`appearance.zero_after_claim`), decided by the caller, which owns the
+    per-entity memory this module deliberately does not have. When True an
+    all-zero field is decoded rather than refused, to damage NONE, power
+    plant off, deactivated false. Default False leaves the zero guard intact.
     """
     if not source_declared(site_id):
         return {}
@@ -87,7 +94,15 @@ def decode(appearance_bits: int, kind: int, domain: int, site_id: int) -> dict[s
     # entity also encodes to zero and is read here as silence. That is the
     # safe direction to be wrong — it withholds a claim rather than inventing
     # one — but it IS a limitation, not a proof.
-    if appearance_bits == 0:
+    #
+    # The opt-in resolves that ambiguity for one kind of source. The synthetic
+    # generator sets the power-plant bit whenever it claims anything, so once
+    # an entity has sent a non-zero field, a later zero is not silence: it is
+    # "power plant off, undamaged", the very case the guard cannot tell apart.
+    # The caller passes zero_is_claim only after seeing that first non-zero
+    # field from a source the ontology opted in. The declaration check above
+    # still applies, so an undeclared source is never decoded either way.
+    if appearance_bits == 0 and not zero_is_claim:
         return {}
     block = (_load().get("appearance") or {}).get(f"{kind}_{domain}")
     if not block:

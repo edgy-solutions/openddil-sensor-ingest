@@ -17,6 +17,12 @@ Architectural placement:
            ▼
   [ Redpanda Connect + sim-dis-mapping.yaml ]  (Bloblang + ontology)
 
+Two further PDU types are READ BUT NEVER PUBLISHED on their own: Electromagnetic
+Emission (23) and Data (20). They feed condition.py, which resolves one
+`condition` per entity (appearance, emission, health datum; worst wins) and
+attaches it to that entity's next Entity State record. A record of their own
+would overwrite the asset's latest state in the compacted downstream topic.
+
 Key design rules:
   - DO NOT inject mock thermal/fuel/power data.  DIS does not carry
     sustainment metrics; the Protobuf schema makes them optional.
@@ -48,9 +54,12 @@ import time
 from io import BytesIO
 
 from appearance import decode as decode_appearance
+import condition
 
 from opendis.PduFactory import createPdu
 from opendis.dis7 import (
+    DataPdu,
+    ElectromagneticEmissionsPdu,
     EntityStatePdu,
     RemoveEntityPdu,
     EventReportPdu,
@@ -250,6 +259,9 @@ KAFKA_PUBLISH_LATENCY = Histogram(
 # ---------------------------------------------------------------------------
 _producer: Producer | None = None
 _shutdown = threading.Event()
+# Per-entity condition memory (arming, last emission, last health datum). In
+# process, so a restart forgets it -- see condition.py.
+_condition = condition.ConditionState()
 
 # ---------------------------------------------------------------------------
 # SIGTERM handler
@@ -313,7 +325,7 @@ def _appearance_raw(pdu) -> int:  # noqa: ANN001
     return int(getattr(pdu, "entityAppearance", 0))
 
 
-def _appearance_decoded(pdu) -> dict:  # noqa: ANN001
+def _appearance_decoded(pdu, zero_is_claim: bool = False) -> dict:  # noqa: ANN001
     """Named facts from the appearance field, or {} if none may be read.
 
     The RAW bits are kept alongside deliberately: Stage 1 must not become the
@@ -326,10 +338,135 @@ def _appearance_decoded(pdu) -> dict:  # noqa: ANN001
         kind=int(getattr(etype, "entityKind", 0)),
         domain=int(getattr(etype, "domain", 0)),
         site_id=int(pdu.entityID.siteID),
+        zero_is_claim=zero_is_claim,
     )
 
 
-def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: ANN001
+def _entity_type_str(etype) -> str:  # noqa: ANN001
+    """kind:domain:country:category:subcategory:specific:extra -- the key
+    form of the emission baselines in dis_condition.yaml."""
+    return ":".join(str(int(getattr(etype, f, 0))) for f in (
+        "entityKind", "domain", "country", "category", "subcategory",
+        "specific", "extra"))
+
+
+def _build_entity_state_record(
+    pdu: EntityStatePdu,  # noqa: ANN001
+    raw_size: int,
+    state: "condition.ConditionState",
+    now: float | None = None,
+) -> dict:
+    """The Entity State record, with `condition` attached when any source claims.
+
+    Order matters: the zero-as-claim decision reads the entity's PREVIOUS
+    appearance history, so it is made before this PDU's bits are noted. The
+    `appearance` key then carries the zero-as-claim decode when it applies,
+    which is what lets the mapping's existing power-OFF path see it.
+    `condition` is absent when no source made a claim -- absence is not health.
+    """
+    urn = _entity_urn(pdu.entityID)
+    site = int(pdu.entityID.siteID)
+    bits = _appearance_raw(pdu)
+    state.note_entity_type(urn, _entity_type_str(pdu.entityType))
+    zero = state.appearance_zero_is_claim(urn, site, bits)
+    payload = _extract_entity_state(pdu, raw_size, zero_is_claim=zero)
+    state.note_appearance(urn, site, bits, payload["appearance"], now)
+    cond = state.resolve(urn, site, now)
+    if cond is not None:
+        payload["condition"] = cond
+    return payload
+
+
+def _extract_emission_systems(pdu) -> list[dict]:  # noqa: ANN001
+    """EE systems as [{"emitter_name": int, "beams": [{"erp_dbm": float}]}]."""
+    systems = []
+    for s in pdu.systems:
+        systems.append({
+            "emitter_name": int(s.emitterSystem.emitterName),
+            "beams": [{"erp_dbm": float(b.fundamentalParameterData.effectiveRadiatedPower)}
+                      for b in s.beamRecords],
+        })
+    return systems
+
+
+def _accept_emission(
+    pdu: "ElectromagneticEmissionsPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this EE PDU is this sidecar's to read.
+
+    Keyed on the EMITTING entity, site then entity filter, no
+    stall.note_input() -- see the call site.
+    """
+    if site_id is not None and int(pdu.emittingEntityID.siteID) != site_id:
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if not _entity_admitted(pdu.emittingEntityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
+    return True
+
+
+def _accept_data(
+    pdu: "DataPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+) -> bool:
+    """True when this Data PDU is this sidecar's to read (originating entity)."""
+    if site_id is not None and int(pdu.originatingEntityID.siteID) != site_id:
+        DIS_PDUS_FILTERED.labels(reason="site").inc()
+        return False
+    if not _entity_admitted(pdu.originatingEntityID, admitted):
+        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        return False
+    return True
+
+
+def _handle_emission(
+    pdu: "ElectromagneticEmissionsPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+    state: "condition.ConditionState",
+    now: float | None = None,
+) -> bool:
+    """Feed an accepted EE PDU into the condition state. True when accepted.
+
+    The baseline lookup needs the entity type, which an EE does not carry; it
+    comes from the last Entity State seen for the entity. None yet -> the
+    state counts it and makes no claim.
+    """
+    if not _accept_emission(pdu, site_id, admitted):
+        return False
+    urn = _entity_urn(pdu.emittingEntityID)
+    state.note_emission(urn, int(pdu.emittingEntityID.siteID),
+                        state.entity_type(urn), _extract_emission_systems(pdu), now)
+    return True
+
+
+def _handle_data(
+    pdu: "DataPdu",  # noqa: F821
+    site_id: int | None,
+    admitted: frozenset[str] | None,
+    state: "condition.ConditionState",
+    now: float | None = None,
+) -> bool:
+    """Feed an accepted Data PDU's health datum into the condition state."""
+    if not _accept_data(pdu, site_id, admitted):
+        return False
+    datum_id = (state.cfg.get("data_health") or {}).get("datum_id")
+    if datum_id is None:
+        return True
+    urn = _entity_urn(pdu.originatingEntityID)
+    for fd in pdu.fixedDatumRecords:
+        if int(fd.fixedDatumID) == int(datum_id):
+            state.note_datum(urn, int(pdu.originatingEntityID.siteID),
+                             int(fd.fixedDatumValue), now)
+    return True
+
+
+def _extract_entity_state(pdu: EntityStatePdu, raw_size: int,  # noqa: ANN001
+                          zero_is_claim: bool = False) -> dict:
     """
     Extract fields from a decoded EntityStatePdu into the JSON structure
     expected by sim-dis-mapping.yaml.
@@ -394,7 +531,7 @@ def _extract_entity_state(pdu: EntityStatePdu, raw_size: int) -> dict:  # noqa: 
         # all-zero (silence, not "undamaged"), or when the kind/domain has no
         # entry. A consumer must read a missing key as NO CLAIM — never as a
         # negative. See appearance.py for both refusals.
-        "appearance":              _appearance_decoded(pdu),
+        "appearance":              _appearance_decoded(pdu, zero_is_claim),
         "dead_reckoning_algorithm": int(getattr(pdu.deadReckoningParameters, "deadReckoningAlgorithm", 0)),
         "pdu_sequence":             0,  # PDU sequence not in opendis EntityStatePdu header
         "ingest_timestamp":         datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1073,7 +1210,9 @@ def run():
                 # --- Filter: only PDU types this sidecar understands ---
                 # Entity State (type 1, unchanged path), Remove Entity (type
                 # 12, ADR-0044 slice A), Event Report (type 21), and Fire /
-                # Detonation (types 2 / 3, effector events). Anything else is
+                # Detonation (types 2 / 3, effector events). Data (20) and
+                # Electromagnetic Emission (23) are read into the condition
+                # state and publish nothing themselves. Anything else is
                 # decoded fine by opendis but is not a signal this sidecar acts
                 # on, so it is dropped and counted rather than silently
                 # discarded -- dis_pdus_received_total{pdu_type=...} already
@@ -1113,7 +1252,7 @@ def run():
 
                     # --- Extract to JSON ---
                     try:
-                        payload = _extract_entity_state(pdu, len(data))
+                        payload = _build_entity_state_record(pdu, len(data), _condition)
                     except Exception as exc:
                         DIS_DECODE_ERRORS.inc()
                         logger.warning("Field extraction error from %s: %s", addr, exc)
@@ -1226,11 +1365,37 @@ def run():
                         logger.warning("Field extraction error from %s: %s", addr, exc)
                         continue
 
+                elif pdu_type in (20, 23):
+                    expected_cls = DataPdu if pdu_type == 20 else ElectromagneticEmissionsPdu
+                    if not isinstance(pdu, expected_cls):
+                        DIS_DECODE_ERRORS.inc()
+                        logger.debug("PDU type=%d but not %s from %s — dropping",
+                                     pdu_type, expected_cls.__name__, addr)
+                        continue
+
+                    # Read into the condition state and publish NOTHING: the
+                    # claim rides on the entity's next Entity State record
+                    # (see condition.py). Same site-then-entity filters as ES.
+                    #
+                    # Neither calls stall.note_input(). The stall rule is
+                    # "input advanced while output did not" (stall.py), and
+                    # these produce no output record of their own, so counting
+                    # them as input would make a healthy sidecar that is
+                    # receiving only EE/Data between Entity States look
+                    # stalled -- the ES block's comment above explains the
+                    # same trap for other sites' traffic.
+                    if pdu_type == 23:
+                        _handle_emission(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS, _condition)
+                    else:
+                        _handle_data(pdu, DIS_SITE_ID, DIS_ADMITTED_ENTITY_IDS, _condition)
+                    continue
+
                 else:
                     DIS_PDUS_DROPPED_BY_TYPE.labels(pdu_type=str(pdu_type)).inc()
                     logger.debug("Dropped PDU type %d from %s (not Entity State, "
                                  "Remove Entity, Event Report, Fire, "
-                                 "Detonation, or Resupply Received)", pdu_type, addr)
+                                 "Detonation, Resupply Received, Data, or "
+                                 "Electromagnetic Emission)", pdu_type, addr)
                     continue
 
             # Fire/Detonation records carry launcher_urn, not entity_id_urn
