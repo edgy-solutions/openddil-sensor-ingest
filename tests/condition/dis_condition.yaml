@@ -68,7 +68,8 @@ emission:
   #     `erp_dbm - erp_tolerance_db` -> DEGRADED.
   #   - Silence after the entity has been seen emitting (armed) for
   #     `silence_after_s` -> SENSOR_FAILED. An explicit EE with zero systems or
-  #     zero beams -> SENSOR_FAILED at once.
+  #     zero beams -> NOT_EMITTING at once (the emitter's own statement that
+  #     it is not radiating); it still arms silence.
   #   - Silence while appearance claims NOT_EMITTING / DEACTIVATED / DESTROYED
   #     is explained, so it claims nothing.
   #   - Never armed, or no baseline for the type -> no claim.

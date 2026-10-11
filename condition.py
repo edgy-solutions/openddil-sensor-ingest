@@ -129,7 +129,7 @@ def _rfc3339(t: float) -> str:
 
 class _Entity:
     __slots__ = ("appearance_claims", "appearance_armed", "emission_armed",
-                 "last_ee", "emission_claim", "silence_after_s",
+                 "last_ee", "last_ee_beams", "emission_claim", "silence_after_s",
                  "datum_value", "datum_time", "entity_type")
 
     def __init__(self) -> None:
@@ -137,6 +137,7 @@ class _Entity:
         self.appearance_armed = False
         self.emission_armed = False
         self.last_ee: float | None = None
+        self.last_ee_beams: bool | None = None                    # last EE had >= 1 beam
         self.emission_claim: tuple[str, str] | None = None        # level, detail
         self.silence_after_s: float | None = None
         self.datum_value: float | None = None
@@ -244,10 +245,15 @@ class ConditionState:
         e.last_ee = t
         e.silence_after_s = float(base.get("silence_after_s", 0) or 0)
         beams = [b for s in systems for b in (s.get("beams") or [])]
+        e.last_ee_beams = bool(beams)
         if not beams:
-            # An explicit EE with nothing in it is a positive statement that
-            # the emitter is not radiating, so it needs no arming.
-            e.emission_claim = ("SENSOR_FAILED", "zero beams")
+            # An explicit EE with nothing in it is the emitter's positive,
+            # deliberate statement that it is not radiating: NOT_EMITTING, not
+            # a failure, and it needs no arming to be believed. It DOES arm
+            # silence, though: the emitter has spoken, so a later total absence
+            # of EEs past silence_after_s must still read SENSOR_FAILED.
+            e.emission_armed = True
+            e.emission_claim = ("NOT_EMITTING", "zero beams")
         else:
             e.emission_armed = True
             parts: list[str] = []
@@ -263,6 +269,24 @@ class ConditionState:
             e.emission_claim = (("DEGRADED", ", ".join(parts)) if parts
                                 else ("NOMINAL", f"{len(beams)} beams"))
         CONDITION_CLAIMS.labels(source="EMISSION", level=e.emission_claim[0]).inc()
+
+    def emitting(self, urn: str, now: float | None = None) -> bool | None:
+        """Is the entity radiating? True / False, or None for "no claim".
+
+        True: the last EE (seen within the baseline's silence_after_s) had at
+        least one beam. False: it had zero beams -- the emitter's own statement
+        that it is not radiating. None: no EE seen, no baseline for the type or
+        an undeclared source, silence_after_s missing or <= 0, or the last EE
+        is silence_after_s old or older. Silence is never a signal.
+        """
+        e = self._entities.get(urn)
+        if e is None or e.last_ee is None or e.last_ee_beams is None:
+            return None
+        if not e.silence_after_s or e.silence_after_s <= 0:
+            return None
+        if self._t(now) - e.last_ee >= e.silence_after_s:
+            return None
+        return e.last_ee_beams
 
     # -- health datum ----------------------------------------------------
     def _datum_level(self, value: float) -> str:

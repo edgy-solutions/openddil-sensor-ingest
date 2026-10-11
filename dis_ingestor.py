@@ -374,6 +374,11 @@ def _build_entity_state_record(
     cond = state.resolve(urn, site, now)
     if cond is not None:
         payload["condition"] = cond
+    # The EE for a tick follows its ES, so this carries the PREVIOUS EE's
+    # state. Omitted entirely when there is no claim: silence is not a signal.
+    emitting = state.emitting(urn, now)
+    if emitting is not None:
+        payload["emission"] = {"emitting": emitting}
     return payload
 
 

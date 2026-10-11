@@ -218,13 +218,80 @@ def test_erp_within_tolerance_is_nominal(st):
     assert _levels(st.resolve(URN, SITE)) == {"EMISSION": "NOMINAL"}
 
 
-def test_zero_beams_failed_even_unarmed(st):
+def test_zero_beams_is_not_emitting_even_unarmed(st):
     _feed_ee(st, ee_bytes(SITE, [], systems=1))
     r = st.resolve(URN, SITE)
-    assert _levels(r) == {"EMISSION": "SENSOR_FAILED"}
+    assert _levels(r) == {"EMISSION": "NOT_EMITTING"}
     assert _detail(r, "EMISSION") == "zero beams"
     _feed_ee(st, ee_bytes(SITE, [], systems=0))
-    assert _levels(st.resolve(URN, SITE)) == {"EMISSION": "SENSOR_FAILED"}
+    assert _levels(st.resolve(URN, SITE)) == {"EMISSION": "NOT_EMITTING"}
+
+
+def test_emitting_true_after_beamed_ee(st):
+    _feed_ee(st, ee_bytes(SITE, [80.0] * 2))
+    assert st.emitting(URN) is True
+
+
+def test_emitting_false_after_zero_beam_ee(st):
+    _feed_ee(st, ee_bytes(SITE, [], systems=1))
+    assert st.emitting(URN) is False
+
+
+def test_emitting_none_before_any_ee(st):
+    st.note_entity_type(URN, TYPE)
+    assert st.emitting(URN) is None
+    assert st.emitting("dis:1:1:999") is None
+
+
+def test_emitting_none_after_silence_window(st, clock):
+    _feed_ee(st, ee_bytes(SITE, [80.0] * 4))
+    clock.t += 14
+    assert st.emitting(URN) is True
+    clock.t += 1
+    assert st.emitting(URN) is None
+    _feed_ee(st, ee_bytes(SITE, [], systems=1))
+    assert st.emitting(URN) is False
+    clock.t += 15
+    assert st.emitting(URN) is None
+
+
+def test_emitting_none_for_unbaselined_type(st):
+    st.note_entity_type(URN, "1:2:999:9:9:9:1")
+    dis_ingestor._handle_emission(_decode_ee(ee_bytes(SITE, [80.0])), None, None, st)
+    assert st.emitting(URN) is None
+
+
+@pytest.mark.parametrize("extra", ["", ", silence_after_s: 0.0"])
+def test_emitting_none_when_silence_after_missing_or_zero(clock, tmp_path, extra):
+    shutil.copy(HERE / "dis_condition.yaml", tmp_path / "dis_condition.yaml")
+    (tmp_path / "dis_condition_baselines.yaml").write_text(
+        f'"{TYPE}": {{ beams: 4, erp_dbm: 80.0, erp_tolerance_db: 6.0{extra} }}\n')
+    s = condition.ConditionState(now=clock, config=condition.load_config(str(tmp_path)))
+    _feed_ee(s, ee_bytes(SITE, [80.0] * 4))
+    assert s.emitting(URN) is None
+
+
+def test_zero_beam_then_total_silence_is_sensor_failed(st, clock):
+    _feed_ee(st, ee_bytes(SITE, [], systems=1))
+    assert _levels(st.resolve(URN, SITE)) == {"EMISSION": "NOT_EMITTING"}
+    clock.t += 16
+    r = st.resolve(URN, SITE)
+    assert _levels(r) == {"EMISSION": "SENSOR_FAILED"}
+    assert _detail(r, "EMISSION") == "silent 16s"
+
+
+def test_es_record_emission_key(st, clock):
+    rec = dis_ingestor._build_entity_state_record(es_pdu(0), 100, st, clock.t)
+    assert "emission" not in rec
+    _feed_ee(st, ee_bytes(SITE, [80.0] * 4))
+    rec = dis_ingestor._build_entity_state_record(es_pdu(0), 100, st, clock.t)
+    assert rec["emission"] == {"emitting": True}
+    _feed_ee(st, ee_bytes(SITE, [], systems=1))
+    rec = dis_ingestor._build_entity_state_record(es_pdu(0), 100, st, clock.t)
+    assert rec["emission"] == {"emitting": False}
+    clock.t += 20
+    rec = dis_ingestor._build_entity_state_record(es_pdu(0), 100, st, clock.t)
+    assert "emission" not in rec
 
 
 def test_armed_then_silent_is_sensor_failed(st, clock):
