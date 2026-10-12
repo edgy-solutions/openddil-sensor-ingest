@@ -6,7 +6,7 @@ Listens on UDP 0.0.0.0:62040, parses binary IEEE 1278.1 DIS Entity State PDUs
 via opendis==1.0, and publishes structured JSON to Kafka topic ingress-dis-raw.
 
 Architectural placement:
-  [ DIS Simulator (VR-Forces / AFSIM / SIMDIS) ]
+  [ DIS Simulator (the co-located simulator, AFSIM, or SIMDIS) ]
            │ binary UDP, port 62040
            ▼
   [ dis_ingestor.py  ← THIS FILE ]
