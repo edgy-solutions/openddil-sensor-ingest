@@ -29,6 +29,10 @@ Key design rules:
   - No arithmetic in this file — unit conversion belongs in algorithms.py.
   - Kafka unavailable on startup → exponential backoff up to 60 s.
   - SIGTERM → flush(10 s) then clean exit.
+  - One-shot PDUs (Fire, Detonation, Event Report, Remove Entity, Resupply
+    Received) are spooled to disk when INGEST_SPOOL_DIR is set, so delivery
+    is at-least-once; see spool.py. A fatal producer error, or a wedged
+    client with the broker up, exits 70.
   - Prometheus /metrics on :8080.
 
 Library verification (2026-05-12, Task 1):
@@ -39,6 +43,7 @@ Library verification (2026-05-12, Task 1):
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 from http.server import ThreadingHTTPServer
 import logging
@@ -67,11 +72,12 @@ from opendis.dis7 import (
     DetonationPdu,
 )
 
-from confluent_kafka import Producer, KafkaException
-from prometheus_client import Counter, Histogram
+from confluent_kafka import Producer, KafkaError, KafkaException
+from prometheus_client import Counter, Gauge, Histogram
 from prometheus_client.exposition import MetricsHandler
 
 import ready
+import spool as spool_mod
 import stall
 
 # ---------------------------------------------------------------------------
@@ -148,6 +154,15 @@ OPENDDIL_REGION_ID = os.getenv("OPENDDIL_REGION_ID", "region-01")
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "8080"))
 
 KAFKA_BACKOFF_MAX_S = 60  # Maximum backoff before giving up on producer connect
+
+# One-shot PDU spool. Unset or empty INGEST_SPOOL_DIR means OFF: behaviour is
+# exactly as it was before the spool existed (producer built first, then the
+# socket bound, nothing written to disk).
+INGEST_SPOOL_DIR = os.getenv("INGEST_SPOOL_DIR", "")
+INGEST_SPOOL_MAX = int(os.getenv("INGEST_SPOOL_MAX", "10000"))
+INGEST_SPOOL_RETRY_S = float(os.getenv("INGEST_SPOOL_RETRY_S", "10"))
+INGEST_SPOOL_STALL_S = float(os.getenv("INGEST_SPOOL_STALL_S", "90"))
+INGEST_MESSAGE_TIMEOUT_MS = int(os.getenv("INGEST_MESSAGE_TIMEOUT_MS", "60000"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -248,6 +263,11 @@ KAFKA_PUBLISH_ERRORS = Counter(
     "kafka_publish_errors_total",
     "Total Kafka publish errors",
 )
+DIS_PDUS_DROPPED_NO_PRODUCER = Counter(
+    "dis_pdus_dropped_no_producer_total",
+    "Entity State records dropped because the Kafka producer was not yet "
+    "built (spool mode only; heartbeats are not spooled)",
+)
 KAFKA_PUBLISH_LATENCY = Histogram(
     "kafka_publish_latency_seconds",
     "Kafka publish round-trip latency in seconds",
@@ -258,6 +278,20 @@ KAFKA_PUBLISH_LATENCY = Histogram(
 # Global state
 # ---------------------------------------------------------------------------
 _producer: Producer | None = None
+_spool: spool_mod.Spool | None = None
+# Spool entries currently handed to the producer and not yet confirmed or
+# failed. Touched only from the main loop thread (delivery callbacks run in
+# poll()), so an entry is never in the producer queue twice.
+_inflight: set[str] = set()
+DIS_SPOOL_PENDING = Gauge(
+    "dis_spool_pending", "One-shot records waiting in the spool",
+)
+DIS_SPOOL_PENDING.set_function(lambda: len(_spool.pending()) if _spool else 0)
+DIS_SPOOL_OLDEST_AGE = Gauge(
+    "dis_spool_oldest_age_seconds", "Age of the oldest pending spool record",
+)
+DIS_SPOOL_OLDEST_AGE.set_function(
+    lambda: (_spool.oldest_age_s(time.time()) or 0.0) if _spool else 0.0)
 _shutdown = threading.Event()
 # Per-entity condition memory (arming, last emission, last health datum). In
 # process, so a restart forgets it -- see condition.py.
@@ -277,6 +311,43 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 # ---------------------------------------------------------------------------
 # Kafka producer with exponential backoff
 # ---------------------------------------------------------------------------
+def _exit_process(code: int) -> None:
+    """Hard exit. A seam so tests can observe it without dying."""
+    os._exit(code)   # EX_SOFTWARE is 70
+
+
+def _is_fatal(err) -> bool:  # noqa: ANN001
+    """True when the producer instance can never publish again.
+
+    librdkafka reports fatal either through the error's own fatal() flag or
+    by returning code _FATAL ("Local: Fatal error") from later calls, and the
+    flag is not reliably set on those later errors -- so test both.
+    """
+    if err is None:
+        return False
+    if callable(getattr(err, "fatal", None)) and err.fatal():
+        return True
+    return err.code() == KafkaError._FATAL
+
+
+def _die_if_fatal(err, where: str) -> bool:  # noqa: ANN001
+    if not _is_fatal(err):
+        return False
+    logger.critical(
+        "FATAL Kafka producer state (%s, seen in %s) — the producer cannot "
+        "publish again. Exiting so the pod restarts; staying up "
+        "would keep decoding into a dead client.", err, where)
+    # Flush is pointless on a fatal producer and would block the exit.
+    _exit_process(70)
+    return True
+
+
+def _error_cb(err) -> None:  # noqa: ANN001
+    if _die_if_fatal(err, "error_cb"):
+        return
+    logger.warning("Kafka client error: %s", err)
+
+
 def _build_producer() -> Producer:
     conf = {
         "bootstrap.servers": KAFKA_BROKERS,
@@ -284,7 +355,12 @@ def _build_producer() -> Producer:
         "linger.ms":          20,
         "compression.type":   "zstd",
         "enable.idempotence": True,
+        "error_cb":           _error_cb,
     }
+    if INGEST_SPOOL_DIR:
+        # Report an undeliverable record after this long instead of
+        # librdkafka's 300 s default; the spool keeps it for replay.
+        conf["message.timeout.ms"] = INGEST_MESSAGE_TIMEOUT_MS
     backoff = 1.0
     while not _shutdown.is_set():
         try:
@@ -303,18 +379,134 @@ def _build_producer() -> Producer:
     sys.exit(0)
 
 
+def _build_producer_async() -> None:
+    global _producer  # noqa: PLW0603
+    _producer = _build_producer()
+
+
 # ---------------------------------------------------------------------------
 # Delivery callback
 # ---------------------------------------------------------------------------
-def _on_delivery(err, msg):  # noqa: ANN001
+def _on_delivery(err, msg, spool_name: str | None = None):  # noqa: ANN001
+    if spool_name is not None:
+        _inflight.discard(spool_name)
     if err:
+        if _die_if_fatal(err, "delivery callback"):
+            return
         KAFKA_PUBLISH_ERRORS.inc()
-        logger.warning("Kafka delivery error: %s", err)
+        if spool_name is not None:
+            logger.warning("Kafka delivery error: %s (kept in spool for replay)", err)
+        else:
+            logger.warning("Kafka delivery error: %s", err)
         return
+    if spool_name is not None and _spool is not None:
+        _spool.ack(spool_name)
     # CONFIRMED DELIVERY, not a successful produce() call. produce() enqueues
     # locally and returns fine while the producer is disconnected, so marking
     # progress there would report health exactly when there is none.
     stall.note_output()
+
+
+def _produce_spooled(name: str, rec: dict) -> None:
+    """Hand one spool entry to the producer. May raise BufferError."""
+    _inflight.add(name)
+    try:
+        _producer.produce(
+            topic=rec["topic"],
+            key=rec["key"],
+            value=rec["value"].encode("utf-8"),
+            on_delivery=functools.partial(_on_delivery, spool_name=name),
+        )
+    except BaseException:
+        _inflight.discard(name)
+        raise
+
+
+def _replay(min_age_s: float) -> int:
+    """Produce pending entries older than min_age_s that are not in flight."""
+    if _spool is None or _producer is None:
+        return 0
+    n = 0
+    now = time.time()
+    for name in _spool.pending():
+        if name in _inflight or _spool.age_s(name, now) < min_age_s:
+            continue
+        try:
+            rec = _spool.read(name)
+        except (OSError, ValueError) as exc:
+            logger.error("Unreadable spool entry %s (%s); set aside", name, exc)
+            _spool.quarantine(name)
+            continue
+        try:
+            _produce_spooled(name, rec)
+        except BufferError:
+            break
+        except KafkaException as exc:
+            err = exc.args[0] if exc.args else None
+            _die_if_fatal(err, "replay produce")
+            logger.warning("Spool replay produce error: %s", exc)
+            break
+        n += 1
+    if n:
+        _producer.poll(0)
+    return n
+
+
+def _publish(key, body: bytes, pdu_type: int) -> None:  # noqa: ANN001
+    """Publish one record; one-shot types go through the spool when it is on."""
+    one_shot = _spool is not None and pdu_type in spool_mod.ONE_SHOT_PDU_TYPES
+    name = None
+    if one_shot:
+        name = _spool.write(KAFKA_TOPIC, key, body.decode("utf-8"))
+    if _producer is None:
+        # Spool mode, producer still being built in the background. A
+        # one-shot is already on disk and is replayed once the producer is
+        # ready. Entity State is a heartbeat and is dropped (and counted):
+        # the next one heals it.
+        if not one_shot:
+            DIS_PDUS_DROPPED_NO_PRODUCER.inc()
+        return
+    t0 = time.monotonic()
+    try:
+        if one_shot:
+            _produce_spooled(name, {"topic": KAFKA_TOPIC, "key": key,
+                                    "value": body.decode("utf-8")})
+        else:
+            _producer.produce(
+                topic=KAFKA_TOPIC,
+                key=key,
+                value=body,
+                on_delivery=_on_delivery,
+            )
+        _producer.poll(0)  # Non-blocking delivery callback service
+        KAFKA_PUBLISH_LATENCY.observe(time.monotonic() - t0)
+    except BufferError:
+        KAFKA_PUBLISH_ERRORS.inc()
+        if one_shot:
+            # Already on disk: do NOT drop it. The replay step sends it.
+            logger.warning("Kafka producer queue full; spooled for replay (%s)", key)
+        else:
+            # Producer queue full — log and drop rather than block
+            logger.warning("Kafka producer queue full — dropping PDU %s", key)
+    except KafkaException as exc:
+        KAFKA_PUBLISH_ERRORS.inc()
+        # A FATAL PRODUCER ERROR IS NOT A WARNING. librdkafka marks an error
+        # fatal when the producer instance can never publish again -- the
+        # client is dead and only a new one will do. A process that cannot do
+        # its job must say so by dying, not by counting: exiting non-zero lets
+        # Kubernetes restart it, and a crash loop is visible where a wedge is
+        # not. After a fatal error librdkafka returns _FATAL here without the
+        # fatal() flag, so _is_fatal tests the code as well.
+        err = exc.args[0] if exc.args else None
+        _die_if_fatal(err, "produce")
+        logger.warning("Kafka produce error for %s: %s", key, exc)
+
+
+def _metadata_probe() -> None:
+    """Ask the broker for metadata; raises if it is down or unreachable."""
+    if _producer is None:
+        raise RuntimeError("producer not built yet")
+    _producer.list_topics(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1113,24 +1305,7 @@ def _accept_event_report(
     return True
 
 
-def run():
-    global _producer  # noqa: PLW0603
-
-    # Metrics AND the liveness endpoint on one server. The stall state lives
-    # in-process because the component already knows its own progress; see
-    # stall.py for why this gates LIVENESS rather than readiness.
-    _serve_http()
-    logger.info("Prometheus /metrics and /healthz/live, /healthz/ready listening on :%d",
-                PROMETHEUS_PORT)
-
-    # Connect to Kafka (blocks until ready or shutdown)
-    _producer = _build_producer()
-
-    # Start stats logger thread
-    stats_thread = threading.Thread(target=_stats_logger, daemon=True)
-    stats_thread.start()
-
-    # Open UDP socket
+def _open_socket() -> socket.socket:
     if DIS_MULTICAST_GROUP:
         sock = _open_multicast_socket(DIS_MULTICAST_GROUP, DIS_MULTICAST_IFACE,
                                        UDP_PORT, UDP_BUFSIZE)
@@ -1148,6 +1323,38 @@ def run():
             "Listening on UDP %s:%d (unicast, SO_RCVBUF=%d MB)",
             UDP_HOST, UDP_PORT, UDP_BUFSIZE // (1024 * 1024),
         )
+    return sock
+
+
+def run():
+    global _producer  # noqa: PLW0603
+
+    # Metrics AND the liveness endpoint on one server. The stall state lives
+    # in-process because the component already knows its own progress; see
+    # stall.py for why this gates LIVENESS rather than readiness.
+    _serve_http()
+    logger.info("Prometheus /metrics and /healthz/live, /healthz/ready listening on :%d",
+                PROMETHEUS_PORT)
+
+    global _spool  # noqa: PLW0603
+    if INGEST_SPOOL_DIR:
+        _spool = spool_mod.Spool(INGEST_SPOOL_DIR, INGEST_SPOOL_MAX)
+        logger.info("Spool ON: dir=%s max=%d pending=%d", INGEST_SPOOL_DIR,
+                    INGEST_SPOOL_MAX, len(_spool.pending()))
+        # Bind the socket FIRST and build the producer in the background, so
+        # nothing is missed while the broker is down. Until the producer
+        # exists one-shots go to the spool only (replayed once it is ready)
+        # and Entity State is dropped and counted.
+        sock = _open_socket()
+        threading.Thread(target=_build_producer_async, daemon=True).start()
+    else:
+        # Spool off: block on the producer, then bind, exactly as before.
+        _producer = _build_producer()
+        sock = _open_socket()
+
+    # Start stats logger thread
+    stats_thread = threading.Thread(target=_stats_logger, daemon=True)
+    stats_thread.start()
 
     # Readiness's start time is "the socket is open," not module import --
     # see ready.py's note_started() for why the import-time default is only
@@ -1173,15 +1380,34 @@ def run():
                     ", ".join(sorted(DIS_ADMITTED_ENTITY_IDS)))
 
     try:
+        stall_watch = None
+        if _spool is not None:
+            stall_watch = spool_mod.StallWatch(
+                _spool, _metadata_probe, _exit_process,
+                stall_s=INGEST_SPOOL_STALL_S)
+        replayed_at_start = False
+        last_replay = time.monotonic()
         while not _shutdown.is_set():
+            if _spool is not None:
+                if _producer is not None:
+                    if not replayed_at_start:
+                        replayed_at_start = True
+                        logger.info("Spool replay at startup: %d record(s) "
+                                    "produced", _replay(0.0))
+                    elif time.monotonic() - last_replay >= INGEST_SPOOL_RETRY_S:
+                        last_replay = time.monotonic()
+                        _replay(INGEST_SPOOL_RETRY_S)
+                stall_watch.check()
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
-                _producer.poll(0)  # Service delivery callbacks
+                if _producer is not None:
+                    _producer.poll(0)  # Service delivery callbacks
                 continue
 
             # --- Resupply Received (type 7): hand-decoded, never createPdu ---
             if len(data) >= 12 and data[2] == 7:
+                pdu_type = 7
                 DIS_PDUS_RECEIVED.labels(pdu_type="7").inc()
                 try:
                     payload = _parse_resupply_received(data)
@@ -1411,46 +1637,7 @@ def run():
             body = json.dumps(payload, separators=(",", ":")).encode()
 
             # --- Publish to Kafka ---
-            t0 = time.monotonic()
-            try:
-                _producer.produce(
-                    topic=KAFKA_TOPIC,
-                    key=key,
-                    value=body,
-                    on_delivery=_on_delivery,
-                )
-                _producer.poll(0)  # Non-blocking delivery callback service
-                KAFKA_PUBLISH_LATENCY.observe(time.monotonic() - t0)
-            except BufferError:
-                # Producer queue full — log and drop rather than block
-                KAFKA_PUBLISH_ERRORS.inc()
-                logger.warning("Kafka producer queue full — dropping PDU %s", key)
-            except KafkaException as exc:
-                KAFKA_PUBLISH_ERRORS.inc()
-                # A FATAL PRODUCER ERROR IS NOT A WARNING. librdkafka marks an
-                # error fatal when the producer instance can never publish
-                # again -- the client is dead and only a new one will do. This
-                # handler logged it at WARNING and continued the loop, so the
-                # process stayed up, kept receiving UDP, kept decoding, and
-                # published nothing. Measured on edge-01 2026-09-09: 460,181
-                # decoded, 21,264 kafka errors, pod 1/1 Running with zero
-                # restarts, three and a half hours.
-                #
-                # A PROCESS THAT CANNOT DO ITS JOB MUST SAY SO BY DYING, NOT BY
-                # COUNTING. Exiting non-zero lets Kubernetes restart it, and a
-                # crash loop is visible where a wedge is not -- that is the
-                # entire value of the fatal classification librdkafka already
-                # gives us and this code was discarding.
-                err = exc.args[0] if exc.args else None
-                if err is not None and getattr(err, "fatal", None) and err.fatal():
-                    logger.critical(
-                        "FATAL Kafka producer state (%s) — the producer cannot "
-                        "publish again. Exiting so the pod restarts; staying up "
-                        "would keep decoding into a dead client.", err)
-                    # Flush is pointless on a fatal producer and would block
-                    # the exit for its full timeout.
-                    os._exit(70)   # EX_SOFTWARE
-                logger.warning("Kafka produce error for %s: %s", key, exc)
+            _publish(key, body, pdu_type)
 
     finally:
         sock.close()
