@@ -37,23 +37,23 @@ _FIXTURE_TABLE = {
             "damage": {"bits": [3, 4], "values": {0: "NONE", 1: "SLIGHT", 2: "MODERATE", 3: "DESTROYED"}},
             "mobility_kill": {"bit": 1},
             "firepower_kill": {"bit": 2},
-            "power_plant": {"bit": 21},
-            "deactivated": {"bit": 22},
-            "launcher": {"bit": 15},
+            "power_plant": {"bit": 22},
+            "deactivated": {"bit": 23},
+            "launcher": {"bit": 16},
         },
         "1_2": {
             "damage": {"bits": [3, 4], "values": {0: "NONE", 1: "SLIGHT", 2: "MODERATE", 3: "DESTROYED"}},
             "mobility_kill": {"bit": 1},
-            "power_plant": {"bit": 21},
-            "deactivated": {"bit": 22},
+            "power_plant": {"bit": 22},
+            "deactivated": {"bit": 23},
             # No "launcher" entry -- air has no such bit, same reason it has
             # no firepower_kill entry.
         },
     },
 }
 
-_POWERPLANT = 1 << 21
-_LAUNCHER_RAISED = 1 << 15
+_POWERPLANT = 1 << 22
+_LAUNCHER_RAISED = 1 << 16
 
 
 class LauncherRaisedDecodeTests(unittest.TestCase):
@@ -79,7 +79,7 @@ class LauncherRaisedDecodeTests(unittest.TestCase):
 
     def test_air_domain_has_no_launcher_key_even_if_the_bit_is_set(self):
         # "A domain without a field does not get one" (module docstring,
-        # refusal 2) -- bit 15 happens to be set here, but 1_2's block has
+        # refusal 2) -- bit 16 happens to be set here, but 1_2's block has
         # no "launcher" entry, so no claim is manufactured from it.
         bits = _POWERPLANT | _LAUNCHER_RAISED
         out = appearance.decode(bits, kind=1, domain=2, site_id=_SITE)

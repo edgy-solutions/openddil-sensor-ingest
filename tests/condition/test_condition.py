@@ -44,8 +44,8 @@ BASELINE = "%s: { beams: 4, erp_dbm: 80.0, erp_tolerance_db: 6.0, silence_after_
 URN = "dis:1:1:10"
 SITE = 1
 
-_POWERPLANT = 1 << 21
-_DEACTIVATED = 1 << 22
+_POWERPLANT = 1 << 22
+_DEACTIVATED = 1 << 23
 _DAMAGE_SLIGHT = 1 << 3
 _DAMAGE_MODERATE = 2 << 3
 _DAMAGE_DESTROYED = 3 << 3
@@ -55,8 +55,8 @@ _APPEARANCE_TABLE = {
     "appearance": {
         "1_2": {
             "damage": {"bits": [3, 4], "values": {0: "NONE", 1: "SLIGHT", 2: "MODERATE", 3: "DESTROYED"}},
-            "power_plant": {"bit": 21},
-            "deactivated": {"bit": 22},
+            "power_plant": {"bit": 22},
+            "deactivated": {"bit": 23},
         },
     },
 }
