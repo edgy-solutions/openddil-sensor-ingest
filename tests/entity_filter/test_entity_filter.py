@@ -70,6 +70,7 @@ def _entity_state_pdu(site: int, application: int, entity: int) -> EntityStatePd
     pdu.entityID.siteID = site
     pdu.entityID.applicationID = application
     pdu.entityID.entityID = entity
+    pdu.entityType.entityKind = 1  # platform; kind 0 would read as a munition-class refusal
     return _serialize_roundtrip(pdu)
 
 

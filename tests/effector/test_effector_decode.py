@@ -97,6 +97,7 @@ def _build_detonation_pdu(
     quantity: int = 1,
     warhead: int = 0,
     fuse: int = 0,
+    exploding: tuple[int, int, int] = (0, 0, 0),
 ) -> DetonationPdu:
     pdu = DetonationPdu(
         eventID=EventIdentifier(
@@ -114,6 +115,7 @@ def _build_detonation_pdu(
             warhead=warhead, fuse=fuse, quantity=quantity,
         ),
         detonationResult=detonation_result,
+        explodingEntityID=_entity_id(*exploding),
     )
     pdu.firingEntityID = _entity_id(*firing)
     pdu.targetEntityID = _entity_id(*target)
@@ -203,7 +205,6 @@ class DetonationDecodeTests(unittest.TestCase):
         self.assertEqual(payload["detonation_result"], 3)
         self.assertEqual(payload["location"], {"x": 4.0, "y": 5.0, "z": 6.0})
         self.assertIn("ingest_timestamp", payload)
-        self.assertNotIn("munition_urn", payload)
         self.assertNotIn("range", payload)
         self.assertEqual(
             payload["provenance"],
@@ -221,6 +222,22 @@ class DetonationDecodeTests(unittest.TestCase):
         decoded = createPdu(_serialize(pdu))
         payload = dis_ingestor._extract_detonation(decoded)
         self.assertIsNone(payload["target_urn"])
+
+    def test_munition_urn_names_exploding_entity(self):
+        pdu = _build_detonation_pdu(
+            firing=(1, 1, 1), target=(1, 1, 57010), event=(1, 1, 1),
+            detonation_result=3, exploding=(1, 1, 5001),
+        )
+        payload = dis_ingestor._extract_detonation(createPdu(_serialize(pdu)))
+        self.assertEqual(payload["munition_urn"], "dis:1:1:5001")
+
+    def test_munition_zero_is_null(self):
+        pdu = _build_detonation_pdu(
+            firing=(1, 1, 1), target=(1, 1, 57010), event=(1, 1, 1),
+            detonation_result=3, exploding=(0, 0, 0),
+        )
+        payload = dis_ingestor._extract_detonation(createPdu(_serialize(pdu)))
+        self.assertIsNone(payload["munition_urn"])
 
     def test_site_filter_refuses_foreign_firing_entity(self):
         pdu = _build_detonation_pdu(

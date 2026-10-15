@@ -215,6 +215,29 @@ def _parse_admitted_entity_ids(raw: str) -> frozenset[str] | None:
 DIS_ADMITTED_ENTITY_IDS: frozenset[str] | None = _parse_admitted_entity_ids(
     os.getenv("DIS_ADMITTED_ENTITY_IDS", ""))
 
+
+def _parse_munition_claim_ttl(raw: str) -> float:
+    """DIS_MUNITION_CLAIM_TTL_S: seconds a Fire's claim on its munition lasts.
+
+    Fails closed like _parse_admitted_entity_ids: a value that is not a
+    positive number would either never claim (0) or never expire, and
+    neither is something to start with silently.
+    """
+    try:
+        ttl = float(raw)
+    except ValueError:
+        ttl = float("nan")
+    if not ttl > 0 or ttl == float("inf"):
+        logger.critical(
+            "DIS_MUNITION_CLAIM_TTL_S: %r is not a positive number of "
+            "seconds. Refusing to start.", raw)
+        sys.exit(1)
+    return ttl
+
+
+DIS_MUNITION_CLAIM_TTL_S: float = _parse_munition_claim_ttl(
+    os.getenv("DIS_MUNITION_CLAIM_TTL_S", "120"))
+
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
@@ -899,7 +922,8 @@ def _extract_event_report(pdu: "EventReportPdu") -> dict:  # noqa: ANN001,F821
 # and targetEntityID live. Detonation carries firingEntityID too (not just
 # explodingEntityID) -- that is what lets both PDUs be keyed and site-
 # filtered on the same field, the launcher, rather than Detonation needing
-# its own convention.
+# its own convention. The Detonation now carries the munition too
+# (explodingEntityID -> munition_urn, ADR-0049), matching the Fire's field.
 def _entity_urn(entity_id) -> str:  # noqa: ANN001
     return f"dis:{entity_id.siteID}:{entity_id.applicationID}:{entity_id.entityID}"
 
@@ -918,6 +942,42 @@ def _entity_urn_or_none(entity_id) -> str | None:  # noqa: ANN001
             and int(entity_id.entityID) == 0):
         return None
     return _entity_urn(entity_id)
+
+
+# ---------------------------------------------------------------------------
+# Munition claims (ADR-0049 section 2)
+# ---------------------------------------------------------------------------
+# A munition's entity id is minted at launch, so it can never be on the
+# declared admit list; the only party that can vouch for it is the
+# launcher's Fire PDU. An accepted Fire therefore claims the munition it
+# names, and Entity State for a claimed id is admitted. An Entity State that
+# arrives before its Fire is not admitted, and the next one is.
+_munition_claims: dict[str, float] = {}
+_munition_claims_lock = threading.Lock()
+
+
+def _claim_munition(urn: str, now: float) -> None:
+    with _munition_claims_lock:
+        _munition_claims[urn] = now + DIS_MUNITION_CLAIM_TTL_S
+
+
+def _munition_claimed(urn: str, now: float) -> bool:
+    """True while the claim is live; an expired entry is dropped here."""
+    with _munition_claims_lock:
+        expiry = _munition_claims.get(urn)
+        if expiry is None:
+            return False
+        if now >= expiry:
+            del _munition_claims[urn]
+            return False
+        return True
+
+
+def _note_fire_claim(fire_record: dict, now: float) -> None:
+    """Claim the munition an accepted Fire names (no-op without one)."""
+    urn = fire_record.get("munition_urn")
+    if urn is not None:
+        _claim_munition(urn, now)
 
 
 def _entity_admitted(entity_id, admitted: frozenset[str] | None) -> bool:  # noqa: ANN001
@@ -1079,6 +1139,7 @@ def _extract_detonation(pdu: "DetonationPdu") -> dict:  # noqa: ANN001,F821
         "event_urn": f"dis-event:{sim_addr.site}:{sim_addr.application}:{event.eventNumber}",
         "launcher_urn": _entity_urn(pdu.firingEntityID),
         "target_urn": _entity_urn_or_none(pdu.targetEntityID),
+        "munition_urn": _entity_urn_or_none(pdu.explodingEntityID),
         "munition_type": _munition_type_dict(descriptor),
         "quantity": int(descriptor.quantity),
         "warhead": int(descriptor.warhead),
@@ -1210,7 +1271,17 @@ def _accept_entity_state(
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
     if not _entity_admitted(pdu.entityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        # A claimed munition is admitted and its claim refreshed, but it is
+        # not "a platform of mine is alive", so readiness is not touched.
+        urn = _entity_urn(pdu.entityID)
+        now = time.monotonic()
+        if _munition_claimed(urn, now):
+            _claim_munition(urn, now)
+            stall.note_input()
+            return True
+        reason = ("munition_unclaimed"
+                  if int(pdu.entityType.entityKind) != 1 else "entity")
+        DIS_PDUS_FILTERED.labels(reason=reason).inc()
         return False
     stall.note_input()
     ready.note_entity()
@@ -1562,6 +1633,7 @@ def run():
                     try:
                         if pdu_type == 2:
                             payload = _extract_fire(pdu)
+                            _note_fire_claim(payload, time.monotonic())
                         else:
                             payload = _extract_detonation(pdu)
                     except Exception as exc:
