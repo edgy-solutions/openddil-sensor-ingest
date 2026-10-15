@@ -323,5 +323,197 @@ class EventReportFilterKeyingTests(unittest.TestCase):
         self.assertEqual(after, before)
 
 
+
+# ---------------------------------------------------------------------------
+# Deny list (fallback edge) and non-asset sources
+# ---------------------------------------------------------------------------
+from unittest import mock  # noqa: E402
+
+
+def _count(reason: str) -> float:
+    return dis_ingestor.DIS_PDUS_FILTERED.labels(reason=reason)._value.get()
+
+
+def _es_kind(site: int, app: int, entity: int, kind: int) -> EntityStatePdu:
+    pdu = _entity_state_pdu(site, app, entity)
+    pdu.entityType.entityKind = kind
+    return _serialize_roundtrip(pdu)
+
+
+def _with_sources(raw: str):
+    return mock.patch.object(
+        dis_ingestor, "DIS_NON_ASSET_SOURCES",
+        dis_ingestor._parse_non_asset_sources(raw))
+
+
+class DenyListTests(unittest.TestCase):
+    DENY = dis_ingestor.DenyFilter({"dis:1:1:100", "dis:1:1:200"})
+
+    def test_parse_names_the_variable(self):
+        with self.assertLogs("dis_ingestor", "CRITICAL") as cm:
+            with self.assertRaises(SystemExit):
+                dis_ingestor._parse_entity_id_list("bogus", "DIS_DENIED_ENTITY_IDS")
+        self.assertIn("DIS_DENIED_ENTITY_IDS", cm.output[0])
+
+    def test_denied_dropped_with_reason_entity_denied(self):
+        before, plain = _count("entity_denied"), _count("entity")
+        self.assertFalse(dis_ingestor._accept_entity_state(
+            _entity_state_pdu(1, 1, 100), 1, self.DENY))
+        self.assertEqual(_count("entity_denied") - before, 1)
+        self.assertEqual(_count("entity") - plain, 0)
+
+    def test_others_admitted_and_advance_readiness(self):
+        before = ready.state()["entity_pdus"]
+        self.assertTrue(dis_ingestor._accept_entity_state(
+            _entity_state_pdu(1, 1, 999), 1, self.DENY))
+        self.assertEqual(ready.state()["entity_pdus"], before + 1)
+
+    def test_admit_list_keeps_reason_entity(self):
+        before = _count("entity")
+        self.assertFalse(dis_ingestor._accept_entity_state(
+            _entity_state_pdu(1, 1, 5), 1, frozenset({"dis:1:1:1"})))
+        self.assertEqual(_count("entity") - before, 1)
+
+    def test_other_pdu_types_honour_deny(self):
+        before = _count("entity_denied")
+        self.assertFalse(dis_ingestor._accept_remove_entity(
+            _remove_entity_pdu((1, 1, 9), (1, 1, 100)), 1, self.DENY))
+        self.assertFalse(dis_ingestor._accept_effector(
+            _fire_pdu((1, 1, 200), (1, 1, 5)), 1, self.DENY))
+        self.assertEqual(_count("entity_denied") - before, 2)
+        self.assertTrue(dis_ingestor._accept_effector(
+            _fire_pdu((1, 1, 7), (1, 1, 100)), 1, self.DENY))
+
+    def test_resupply_honours_deny(self):
+        before = _count("entity_denied")
+        self.assertFalse(dis_ingestor._accept_resupply_received(
+            {"launcher_urn": "dis:1:1:100"}, 1, self.DENY))
+        self.assertTrue(dis_ingestor._accept_resupply_received(
+            {"launcher_urn": "dis:1:1:101"}, 1, self.DENY))
+        self.assertEqual(_count("entity_denied") - before, 1)
+
+    def test_build_filter_shapes(self):
+        self.assertIsNone(dis_ingestor._build_entity_filter("", ""))
+        self.assertEqual(dis_ingestor._build_entity_filter("dis:1:1:1", ""),
+                         frozenset({"dis:1:1:1"}))
+        got = dis_ingestor._build_entity_filter("", "dis:1:1:1,dis:1:1:2")
+        self.assertIsInstance(got, dis_ingestor.DenyFilter)
+        self.assertEqual(got.ids, frozenset({"dis:1:1:1", "dis:1:1:2"}))
+
+    def test_both_envs_exit(self):
+        with self.assertRaises(SystemExit) as ctx:
+            dis_ingestor._build_entity_filter("dis:1:1:1", "dis:1:1:2")
+        self.assertEqual(ctx.exception.code, 1)
+
+
+class NonAssetSourceTests(unittest.TestCase):
+    ADMIT = frozenset({"dis:1:900:1", "dis:1:1:1"})
+    DENY = dis_ingestor.DenyFilter({"dis:1:1:100"})
+
+    def _drops_source(self, admitted):
+        before = _count("non_asset_source")
+        with _with_sources("1:900"):
+            self.assertFalse(dis_ingestor._accept_entity_state(
+                _entity_state_pdu(1, 900, 1), 1, admitted))
+        self.assertEqual(_count("non_asset_source") - before, 1)
+
+    def test_source_wide_drop_at_admit_list_even_if_listed(self):
+        self._drops_source(self.ADMIT)
+
+    def test_source_wide_drop_at_deny_list(self):
+        self._drops_source(self.DENY)
+
+    def test_source_wide_drop_with_no_list(self):
+        self._drops_source(None)
+
+    def test_sensor_application_unaffected_no_entity_number_rule(self):
+        with _with_sources("1:900"):
+            self.assertTrue(dis_ingestor._accept_entity_state(
+                _entity_state_pdu(1, 1, 5), 1, None))
+            self.assertTrue(dis_ingestor._accept_entity_state(
+                _entity_state_pdu(1, 901, 1), 1, None))
+
+    def test_kind_qualified_drops_only_matching_kind_entity_state(self):
+        before = _count("non_asset_source")
+        with _with_sources("1:900:3"):
+            self.assertFalse(dis_ingestor._accept_entity_state(
+                _es_kind(1, 900, 1, 3), 1, None))
+            self.assertTrue(dis_ingestor._accept_entity_state(
+                _es_kind(1, 900, 2, 1), 1, None))
+            # no entity type on a Remove Entity: a kind entry does not match
+            self.assertTrue(dis_ingestor._accept_remove_entity(
+                _remove_entity_pdu((1, 900, 1), (1, 900, 1)), 1, None))
+        self.assertEqual(_count("non_asset_source") - before, 1)
+
+    def test_source_wide_applies_to_other_pdu_types(self):
+        before = _count("non_asset_source")
+        with _with_sources("1:900"):
+            self.assertFalse(dis_ingestor._accept_remove_entity(
+                _remove_entity_pdu((1, 1, 1), (1, 900, 4)), 1, None))
+            self.assertFalse(dis_ingestor._accept_effector(
+                _fire_pdu((1, 900, 4), (1, 1, 1)), 1, None))
+            self.assertFalse(dis_ingestor._accept_event_report(
+                _event_report_pdu((1, 900, 4), (1, 1, 1)), 1, None))
+            self.assertFalse(dis_ingestor._accept_resupply_received(
+                {"launcher_urn": "dis:1:900:4"}, 1, None))
+        self.assertEqual(_count("non_asset_source") - before, 4)
+
+    def test_claimed_munition_from_non_asset_source_still_dropped(self):
+        urn = "dis:1:900:5001"
+        dis_ingestor._claim_munition(urn, dis_ingestor.time.monotonic())
+        try:
+            before = _count("non_asset_source")
+            with _with_sources("1:900"):
+                self.assertFalse(dis_ingestor._accept_entity_state(
+                    _es_kind(1, 900, 5001, 2), 1, frozenset({"dis:1:1:1"})))
+            self.assertEqual(_count("non_asset_source") - before, 1)
+        finally:
+            dis_ingestor._munition_claims.clear()
+
+    def test_parse_forms(self):
+        self.assertEqual(
+            dis_ingestor._parse_non_asset_sources("1:900, 2:5:3"),
+            frozenset({(1, 900, None), (2, 5, 3)}))
+        self.assertEqual(dis_ingestor._parse_non_asset_sources(""), frozenset())
+
+    def test_malformed_or_duplicate_source_exits(self):
+        for bad in ("1", "a:b", "1:2:3:4", "70000:1", "1:70000", "1:2:256",
+                    "-1:2", "1:900,1:900", "1:900:3,1:900:3"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as ctx:
+                    dis_ingestor._parse_non_asset_sources(bad)
+                self.assertEqual(ctx.exception.code, 1)
+
+
+class DenyClaimedMunitionTests(unittest.TestCase):
+    """The claim path under deny semantics: a denied munition id is refused
+    until a Fire from an admitted launcher claims it."""
+    DENY = dis_ingestor.DenyFilter({"dis:1:1:5001", "dis:1:1:100"})
+
+    def setUp(self):
+        dis_ingestor._munition_claims.clear()
+
+    tearDown = setUp
+
+    def test_denied_unclaimed_munition_refused_munition_unclaimed(self):
+        before = _count("munition_unclaimed")
+        self.assertFalse(dis_ingestor._accept_entity_state(
+            _es_kind(1, 1, 5001, 2), 1, self.DENY))
+        self.assertEqual(_count("munition_unclaimed") - before, 1)
+
+    def test_denied_platform_reason_entity_denied(self):
+        before = _count("entity_denied")
+        self.assertFalse(dis_ingestor._accept_entity_state(
+            _es_kind(1, 1, 100, 1), 1, self.DENY))
+        self.assertEqual(_count("entity_denied") - before, 1)
+
+    def test_claimed_denied_munition_admitted_without_readiness(self):
+        dis_ingestor._claim_munition("dis:1:1:5001", dis_ingestor.time.monotonic())
+        count = ready.state()["entity_pdus"]
+        self.assertTrue(dis_ingestor._accept_entity_state(
+            _es_kind(1, 1, 5001, 2), 1, self.DENY))
+        self.assertEqual(ready.state()["entity_pdus"], count)
+
+
 if __name__ == "__main__":
     unittest.main()

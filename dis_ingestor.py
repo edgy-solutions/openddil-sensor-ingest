@@ -179,8 +179,8 @@ logger = logging.getLogger("dis_ingestor")
 # DIS_SITE_ID above, because a malformed list must log before refusing to
 # start, and logging needs `logger` to exist first.
 # ---------------------------------------------------------------------------
-def _parse_admitted_entity_ids(raw: str) -> frozenset[str] | None:
-    """Parse DIS_ADMITTED_ENTITY_IDS into a validated, de-duplicated set.
+def _parse_entity_id_list(raw: str, var: str = "DIS_ADMITTED_ENTITY_IDS") -> frozenset[str] | None:
+    """Parse an entity-id list env (`var` names it in messages) into a validated, de-duplicated set.
 
     Comma- and/or whitespace-separated entity URNs. Empty/unset -> None,
     meaning "no entity filter" (today's behaviour, exactly).
@@ -200,20 +200,98 @@ def _parse_admitted_entity_ids(raw: str) -> frozenset[str] | None:
     for token in tokens:
         if not _ENTITY_URN_RE.match(token):
             logger.critical(
-                "DIS_ADMITTED_ENTITY_IDS: malformed entity id %r -- expected "
-                "dis:<site>:<app>:<entity>. Refusing to start.", token)
+                "%s: malformed entity id %r -- expected "
+                "dis:<site>:<app>:<entity>. Refusing to start.", var, token)
             sys.exit(1)
         if token in admitted:
             logger.critical(
-                "DIS_ADMITTED_ENTITY_IDS: entity id %r listed twice. "
-                "Refusing to start.", token)
+                "%s: entity id %r listed twice. "
+                "Refusing to start.", var, token)
             sys.exit(1)
         admitted.add(token)
     return frozenset(admitted)
 
 
-DIS_ADMITTED_ENTITY_IDS: frozenset[str] | None = _parse_admitted_entity_ids(
-    os.getenv("DIS_ADMITTED_ENTITY_IDS", ""))
+def _parse_admitted_entity_ids(raw: str) -> frozenset[str] | None:
+    return _parse_entity_id_list(raw, "DIS_ADMITTED_ENTITY_IDS")
+
+
+class DenyFilter:
+    """Entity filter for the fallback edge: admits everything NOT listed.
+
+    Drop-in for the admit set at every call site: `urn in filter` means
+    "admitted", so a denied URN is `not in` it. `None` still means no filter.
+    """
+
+    __slots__ = ("ids",)
+
+    def __init__(self, ids) -> None:  # noqa: ANN001
+        object.__setattr__(self, "ids", frozenset(ids))
+
+    def __setattr__(self, name, value):  # noqa: ANN001
+        raise AttributeError("DenyFilter is immutable")
+
+    def __contains__(self, urn: object) -> bool:
+        return urn not in self.ids
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+
+def _entity_drop_reason(admitted) -> str:  # noqa: ANN001
+    """Counter label for an entity-filter drop: admit list or deny list."""
+    return "entity_denied" if isinstance(admitted, DenyFilter) else "entity"
+
+
+def _build_entity_filter(admit_raw: str, deny_raw: str):  # noqa: ANN201
+    """Admit list -> frozenset, deny list -> DenyFilter, neither -> None.
+    Both set is fatal: one sidecar has one rule."""
+    admit = _parse_entity_id_list(admit_raw, "DIS_ADMITTED_ENTITY_IDS")
+    deny = _parse_entity_id_list(deny_raw, "DIS_DENIED_ENTITY_IDS")
+    if admit is not None and deny is not None:
+        logger.critical(
+            "DIS_ADMITTED_ENTITY_IDS and DIS_DENIED_ENTITY_IDS are both set "
+            "-- one sidecar has one rule. Refusing to start.")
+        sys.exit(1)
+    return DenyFilter(deny) if deny is not None else admit
+
+
+def _parse_non_asset_sources(raw: str) -> frozenset[tuple[int, int, int | None]]:
+    """DIS_NON_ASSET_SOURCES: `site:app` or `site:app:kind`, comma/whitespace
+    separated. Fails closed on a malformed or duplicate entry."""
+    out: set[tuple[int, int, int | None]] = set()
+    for token in (t for t in re.split(r"[\s,]+", raw.strip()) if t):
+        m = re.fullmatch(r"(\d+):(\d+)(?::(\d+))?", token)
+        ok = m is not None
+        if ok:
+            site, app = int(m.group(1)), int(m.group(2))
+            kind = int(m.group(3)) if m.group(3) is not None else None
+            ok = site <= 65535 and app <= 65535 and (kind is None or kind <= 255)
+        if not ok:
+            logger.critical(
+                "DIS_NON_ASSET_SOURCES: malformed source %r -- expected "
+                "<site>:<app> or <site>:<app>:<kind> (site/app 0..65535, "
+                "kind 0..255). Refusing to start.", token)
+            sys.exit(1)
+        if (site, app, kind) in out:
+            logger.critical(
+                "DIS_NON_ASSET_SOURCES: source %r listed twice. "
+                "Refusing to start.", token)
+            sys.exit(1)
+        out.add((site, app, kind))
+    return frozenset(out)
+
+
+def _format_source(src: tuple[int, int, int | None]) -> str:
+    return ":".join(str(x) for x in src if x is not None)
+
+
+DIS_ADMITTED_ENTITY_IDS = _build_entity_filter(
+    os.getenv("DIS_ADMITTED_ENTITY_IDS", ""),
+    os.getenv("DIS_DENIED_ENTITY_IDS", ""))
+
+DIS_NON_ASSET_SOURCES: frozenset[tuple[int, int, int | None]] = (
+    _parse_non_asset_sources(os.getenv("DIS_NON_ASSET_SOURCES", "")))
 
 
 def _parse_munition_claim_ttl(raw: str) -> float:
@@ -612,7 +690,7 @@ def _extract_emission_systems(pdu) -> list[dict]:  # noqa: ANN001
 def _accept_emission(
     pdu: "ElectromagneticEmissionsPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this EE PDU is this sidecar's to read.
 
@@ -622,8 +700,10 @@ def _accept_emission(
     if site_id is not None and int(pdu.emittingEntityID.siteID) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.emittingEntityID):
+        return False
     if not _entity_admitted(pdu.emittingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -631,14 +711,16 @@ def _accept_emission(
 def _accept_data(
     pdu: "DataPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this Data PDU is this sidecar's to read (originating entity)."""
     if site_id is not None and int(pdu.originatingEntityID.siteID) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.originatingEntityID):
+        return False
     if not _entity_admitted(pdu.originatingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -646,7 +728,7 @@ def _accept_data(
 def _handle_emission(
     pdu: "ElectromagneticEmissionsPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
     state: "condition.ConditionState",
     now: float | None = None,
 ) -> bool:
@@ -667,7 +749,7 @@ def _handle_emission(
 def _handle_data(
     pdu: "DataPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
     state: "condition.ConditionState",
     now: float | None = None,
 ) -> bool:
@@ -980,7 +1062,28 @@ def _note_fire_claim(fire_record: dict, now: float) -> None:
         _claim_munition(urn, now)
 
 
-def _entity_admitted(entity_id, admitted: frozenset[str] | None) -> bool:  # noqa: ANN001
+def _non_asset_source(site: int, app: int, kind: int | None = None) -> bool:
+    """True when (site, app[, kind]) is a declared non-asset source.
+
+    A source-wide entry matches on site+application alone; a kind-qualified
+    entry matches only when the PDU carries that entity kind. Counted by the
+    caller as reason=non_asset_source. Never keyed on entity number.
+    """
+    if not DIS_NON_ASSET_SOURCES:
+        return False
+    return ((site, app, None) in DIS_NON_ASSET_SOURCES
+            or (kind is not None and (site, app, kind) in DIS_NON_ASSET_SOURCES))
+
+
+def _source_dropped(entity_id, kind: int | None = None) -> bool:  # noqa: ANN001
+    """Source rule for a key EntityID; counts the drop. Runs before admit/deny."""
+    if _non_asset_source(int(entity_id.siteID), int(entity_id.applicationID), kind):
+        DIS_PDUS_FILTERED.labels(reason="non_asset_source").inc()
+        return True
+    return False
+
+
+def _entity_admitted(entity_id, admitted: "frozenset[str] | DenyFilter | None") -> bool:  # noqa: ANN001
     """True when `entity_id` is on the declared admit list.
 
     Same shape as the site filter: `admitted is None` (DIS_ADMITTED_ENTITY_IDS
@@ -1255,7 +1358,7 @@ def _open_multicast_socket(group: str, iface: str, port: int, bufsize: int) -> s
 def _accept_entity_state(
     pdu: EntityStatePdu,
     site_id: int | None,
-    admitted: frozenset[str] | None = None,
+    admitted: "frozenset[str] | DenyFilter | None" = None,
 ) -> bool:
     """True when this PDU is this sidecar's to publish.
 
@@ -1270,6 +1373,8 @@ def _accept_entity_state(
     if site_id is not None and int(pdu.entityID.siteID) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.entityID, int(pdu.entityType.entityKind)):
+        return False
     if not _entity_admitted(pdu.entityID, admitted):
         # A claimed munition is admitted and its claim refreshed, but it is
         # not "a platform of mine is alive", so readiness is not touched.
@@ -1280,7 +1385,8 @@ def _accept_entity_state(
             stall.note_input()
             return True
         reason = ("munition_unclaimed"
-                  if int(pdu.entityType.entityKind) != 1 else "entity")
+                  if int(pdu.entityType.entityKind) != 1
+                  else _entity_drop_reason(admitted))
         DIS_PDUS_FILTERED.labels(reason=reason).inc()
         return False
     stall.note_input()
@@ -1291,7 +1397,7 @@ def _accept_entity_state(
 def _accept_remove_entity(
     pdu: "RemoveEntityPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this Remove Entity PDU is this sidecar's to publish.
 
@@ -1307,8 +1413,10 @@ def _accept_remove_entity(
     if site_id is not None and int(pdu.receivingEntityID.siteID) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.receivingEntityID):
+        return False
     if not _entity_admitted(pdu.receivingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -1316,7 +1424,7 @@ def _accept_remove_entity(
 def _accept_effector(
     pdu,  # noqa: ANN001
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this Fire/Detonation PDU is this sidecar's to publish.
 
@@ -1328,8 +1436,10 @@ def _accept_effector(
     if not _effector_site_matches(pdu, site_id):
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.firingEntityID):
+        return False
     if not _entity_admitted(pdu.firingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -1337,7 +1447,7 @@ def _accept_effector(
 def _accept_resupply_received(
     payload: dict,
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this Resupply Received record is this sidecar's to publish.
 
@@ -1349,8 +1459,11 @@ def _accept_resupply_received(
     if site_id is not None and int(urn.split(":")[1]) != site_id:
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _non_asset_source(int(urn.split(":")[1]), int(urn.split(":")[2])):
+        DIS_PDUS_FILTERED.labels(reason="non_asset_source").inc()
+        return False
     if admitted is not None and urn not in admitted:
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -1358,7 +1471,7 @@ def _accept_resupply_received(
 def _accept_event_report(
     pdu: "EventReportPdu",  # noqa: F821
     site_id: int | None,
-    admitted: frozenset[str] | None,
+    admitted: "frozenset[str] | DenyFilter | None",
 ) -> bool:
     """True when this Event Report PDU is this sidecar's to publish.
 
@@ -1370,8 +1483,10 @@ def _accept_event_report(
     if not _event_report_site_matches(pdu, site_id):
         DIS_PDUS_FILTERED.labels(reason="site").inc()
         return False
+    if _source_dropped(pdu.originatingEntityID):
+        return False
     if not _entity_admitted(pdu.originatingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason="entity").inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
         return False
     return True
 
@@ -1445,10 +1560,19 @@ def run():
 
     if DIS_ADMITTED_ENTITY_IDS is None:
         logger.info("Entity filter: OFF")
+    elif isinstance(DIS_ADMITTED_ENTITY_IDS, DenyFilter):
+        logger.info("Entity filter: DENY %d ids (fallback edge) -- %s",
+                    len(DIS_ADMITTED_ENTITY_IDS),
+                    ", ".join(sorted(DIS_ADMITTED_ENTITY_IDS.ids)))
     else:
         logger.info("Entity filter: %d ids ONLY -- %s",
                     len(DIS_ADMITTED_ENTITY_IDS),
                     ", ".join(sorted(DIS_ADMITTED_ENTITY_IDS)))
+    if DIS_NON_ASSET_SOURCES:
+        logger.info("Non-asset sources: %d -- %s", len(DIS_NON_ASSET_SOURCES),
+                    ", ".join(_format_source(x) for x in sorted(
+                        DIS_NON_ASSET_SOURCES,
+                        key=lambda t: (t[0], t[1], -1 if t[2] is None else t[2]))))
 
     try:
         stall_watch = None
