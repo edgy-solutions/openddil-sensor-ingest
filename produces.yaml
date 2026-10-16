@@ -1,0 +1,8 @@
+# produces.yaml -- every Kafka topic this repo's workloads can write, as templates over the workload's environment.
+# Checked against the code by tests/test_produces_manifest.py and against the chart by
+# openddil-helm scripts/check-produces-declarations.py.
+workloads:
+  sensor-ingest:
+    image: openddil/sensor-ingest
+    topics:
+      - "${KAFKA_TOPIC:-ingress-dis-raw}"

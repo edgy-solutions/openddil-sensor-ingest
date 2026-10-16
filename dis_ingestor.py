@@ -512,6 +512,8 @@ def _produce_spooled(name: str, rec: dict) -> None:
     """Hand one spool entry to the producer. May raise BufferError."""
     _inflight.add(name)
     try:
+        # Spool records are written from KAFKA_TOPIC, so the topic is not a literal here.
+        # produces: ${KAFKA_TOPIC:-ingress-dis-raw}
         _producer.produce(
             topic=rec["topic"],
             key=rec["key"],
