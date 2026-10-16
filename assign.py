@@ -48,6 +48,9 @@ import re
 
 _URN_RE = re.compile(r"^dis:(\d+):(\d+):(\d+)$")
 _NATION_RE = re.compile(r"^[A-Z]{3}$")
+# An override value that keeps an entity out of every stamping rule. A literal
+# string, not JSON null: Helm drops null-valued keys when it merges values files.
+NATION_EXEMPT = "exempt"
 
 # WGS84
 _A = 6378137.0
@@ -311,8 +314,11 @@ def parse_nation_rules(raw_json: str) -> "NationStamper | None":
     for urn, nation in overrides.items():
         if not _URN_RE.match(urn):
             raise ValueError(f"overrides: malformed entity id {urn!r}")
-        if not isinstance(nation, str) or not _NATION_RE.match(nation):
-            raise ValueError(f"overrides[{urn}]: nation must match [A-Z]{{3}}")
+        if not isinstance(nation, str) or not (
+                nation == NATION_EXEMPT or _NATION_RE.match(nation)):
+            raise ValueError(
+                f"overrides[{urn}]: nation must match [A-Z]{{3}} or be "
+                f"\"{NATION_EXEMPT}\"")
     rules = doc.get("rules", [])
     if not isinstance(rules, list):
         raise ValueError("rules: expected a list")
@@ -330,13 +336,17 @@ def parse_nation_rules(raw_json: str) -> "NationStamper | None":
             raise ValueError(f"{where}.nation: must match [A-Z]{{3}}")
         kind, data = _parse_match(rule.get("match"), where, False, set())
         parsed.append((name, nation, kind, data))
-    return NationStamper(dict(overrides), parsed)
+    # exempt is held as None: "this urn is decided, and has no nation".
+    return NationStamper(
+        {u: (None if n == NATION_EXEMPT else n) for u, n in overrides.items()},
+        parsed)
 
 
 class NationStamper:
     """Which nation, if any, an entity's records are stamped with.
 
     Overrides first (any kind), then, for kind 1 only, the rules first-match.
+    An exempt override (held as None) decides too: the rules are not consulted.
     Sticky per URN, a None included: an entity no rule matched stays
     unstamped rather than flipping when it later drives into a box.
     """
@@ -350,8 +360,10 @@ class NationStamper:
                              country: int, ecef) -> str | None:  # noqa: ANN001
         if urn in self._decided:
             return self._decided[urn]
-        nation = self._overrides.get(urn)
-        if nation is None and kind == 1:
+        nation = None
+        if urn in self._overrides:
+            nation = self._overrides[urn]          # exempt is None, and final
+        elif kind == 1:
             facts = _Facts(marking, country, ecef)
             for _name_, n, rkind, data in self._rules:
                 if _facts_match(rkind, data, facts):
@@ -359,6 +371,12 @@ class NationStamper:
                     break
         self._decided[urn] = nation
         return nation
+
+    def log_summary(self, logger) -> None:  # noqa: ANN001
+        exempt = sorted(u for u, n in self._overrides.items() if n is None)
+        logger.info("Nation rules: %d, overrides: %d (%d exempt)%s",
+                    len(self._rules), len(self._overrides), len(exempt),
+                    (" -- exempt: " + ", ".join(exempt)) if exempt else "")
 
     def nation_for(self, urn: str) -> str | None:
         """For records that are not an Entity State (Fire, Remove, ...).

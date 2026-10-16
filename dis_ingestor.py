@@ -1670,6 +1670,8 @@ def run():
         logger.info("Entity filter: %d ids ONLY -- %s",
                     len(DIS_ADMITTED_ENTITY_IDS),
                     ", ".join(sorted(DIS_ADMITTED_ENTITY_IDS)))
+    if DIS_NATION_STAMPER is not None:
+        DIS_NATION_STAMPER.log_summary(logger)
     if DIS_NON_ASSET_SOURCES:
         logger.info("Non-asset sources: %d -- %s", len(DIS_NON_ASSET_SOURCES),
                     ", ".join(_format_source(x) for x in sorted(

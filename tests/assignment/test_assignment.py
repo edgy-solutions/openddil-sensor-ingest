@@ -513,3 +513,71 @@ def test_any_site_duplicate_fatal_but_coexists_with_site_form():
     assert len(got) == 2
     assert dis_ingestor._format_source((None, 5, 2)) == "*:5:2"
     assert dis_ingestor._format_source((1, 5, None)) == "1:5"
+
+
+# ---------------------------------------------------------------------------
+# Nation stamping: the "exempt" override
+# ---------------------------------------------------------------------------
+EXEMPT_JSON = json.dumps({
+    "overrides": {"dis:1:1:7": "exempt", "dis:1:1:1": "BDR"},
+    "rules": [{"name": "box", "nation": "ATL", "match": {"geofence": BOX}}],
+})
+
+
+def _exempt_stamper():
+    return assign.parse_nation_rules(EXEMPT_JSON)
+
+
+def test_nation_exempt_parses():
+    assert assign.parse_nation_rules(
+        json.dumps({"overrides": {"dis:1:1:7": "exempt"}})) is not None
+
+
+@pytest.mark.parametrize("bad", ["EXEMPT", "Exempt", "", None])
+def test_nation_exempt_spellings_rejected(bad):
+    with pytest.raises(ValueError, match='or be "exempt"'):
+        assign.parse_nation_rules(json.dumps({"overrides": {"dis:1:1:7": bad}}))
+
+
+def test_nation_exempt_entity_matching_a_rule_stays_unstamped():
+    s = _exempt_stamper()
+    assert s.observe_entity_state("dis:1:1:7", 1, "AA", 5,
+                                  geodetic_to_ecef(*IN_BOX)) is None
+    assert s.nation_for("dis:1:1:7") is None
+
+
+def test_nation_exempt_nation_for_before_any_es():
+    assert _exempt_stamper().nation_for("dis:1:1:7") is None
+
+
+def test_nation_exempt_is_sticky():
+    s = _exempt_stamper()
+    assert s.observe_entity_state("dis:1:1:7", 1, "AA", 5,
+                                  geodetic_to_ecef(*OUT_BOX)) is None
+    assert s.observe_entity_state("dis:1:1:7", 1, "AA", 5,
+                                  geodetic_to_ecef(*IN_BOX)) is None
+
+
+def test_nation_non_exempt_entity_matching_the_same_rule_is_stamped():
+    s = _exempt_stamper()
+    assert s.observe_entity_state("dis:1:1:8", 1, "AA", 5,
+                                  geodetic_to_ecef(*IN_BOX)) == "ATL"
+
+
+def test_nation_exempt_records_carry_no_stamped_nation():
+    s = _exempt_stamper()
+    pdu = _es_pdu(1, 1, 7, kind=1, country=5, ecef=geodetic_to_ecef(*IN_BOX))
+    rec = dis_ingestor._build_entity_state_record(pdu, 144, condition.ConditionState())
+    dis_ingestor._stamp_nation(rec, s)
+    assert "stamped_nation" not in rec["origin_node"]
+    er = {"pdu_type": "event_report", "entity_id_urn": "dis:1:1:7",
+          "provenance": {"edge_id": "e", "region_id": "r"}}
+    dis_ingestor._stamp_nation(er, s)
+    assert er["provenance"] == {"edge_id": "e", "region_id": "r"}
+
+
+def test_nation_log_line_counts_exempt(caplog):
+    with caplog.at_level("INFO"):
+        _exempt_stamper().log_summary(logging.getLogger("t"))
+    assert "overrides: 2 (1 exempt)" in caplog.text
+    assert "dis:1:1:7" in caplog.text
