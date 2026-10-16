@@ -27,7 +27,7 @@ The ingestion gateway is fully data-driven. Topics, broker URLs, and sensor mapp
 * **RTI DDS Ingestor:** Run `python dds_ingestor.py --domain-id 0`. This listens to the DDS mesh and wraps the payloads for Redpanda using the Schema Registry.
 
 ## Nation stamping
-`DIS_NATION_RULES` is a JSON object with `overrides` (entity id -> nation) and `rules` (first match wins, kind-1 entities only). A matched entity's records carry `stamped_nation` in their origin block; with no nation the key is omitted. An override value of the literal string `"exempt"` keeps that entity out of every rule: it is never stamped. It is a string rather than JSON null because Helm drops null-valued keys when it merges values files.
+`DIS_NATION_RULES` is a JSON object with `overrides` (entity id -> nation) and `rules` (first match wins, kind-1 entities only). A matched entity's records carry `stamped_nation` in their origin block; with no nation the key is omitted. An override value of the literal string `"exempt"` keeps that entity out of every rule: it is never stamped. It is a plain string rather than JSON null because Helm gives null a special meaning in values (it removes a key when merged over a chart default, and is handled inconsistently across `-f` files).
 
 ## Readiness
 

@@ -49,7 +49,8 @@ import re
 _URN_RE = re.compile(r"^dis:(\d+):(\d+):(\d+)$")
 _NATION_RE = re.compile(r"^[A-Z]{3}$")
 # An override value that keeps an entity out of every stamping rule. A literal
-# string, not JSON null: Helm drops null-valued keys when it merges values files.
+# string, not JSON null: Helm gives null a special meaning in values (it removes
+# a key when merged over a chart default, inconsistently across -f files).
 NATION_EXEMPT = "exempt"
 
 # WGS84
