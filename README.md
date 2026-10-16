@@ -25,3 +25,7 @@ The ingestion gateway is fully data-driven. Topics, broker URLs, and sensor mapp
 ## Running the Ingestors
 
 * **RTI DDS Ingestor:** Run `python dds_ingestor.py --domain-id 0`. This listens to the DDS mesh and wraps the payloads for Redpanda using the Schema Registry.
+
+## Readiness
+
+`/healthz/ready` on the metrics port answers 200 always, with the real state in the JSON body (`ready`, `gates_pod`, the entity counters) and in the `dis_sidecar_ready` gauge (0/1), which is the signal to alert on. By default it gates nothing, so a sidecar can never pull a co-located simulator out of its Services. Set `READY_GATES_POD=1` to restore the gate (503 when not ready) for a pod with no simulator behind a Service.

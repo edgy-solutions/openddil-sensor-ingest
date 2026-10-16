@@ -18,12 +18,19 @@ simulator never run -- reports not ready, and that is the answer.
 
 WHAT IT GATES
 -------------
-Readiness is per POD, not per container: a sidecar that is not ready
-takes the whole pod, the simulator included, out of every Service that
-selects it. stall.py's note that readiness "means nothing" holds for a
-Kafka client alone in its pod; it does not hold here. A deployment that
-reaches its simulator through a Service before the simulator is run must
-either drop this probe or set publishNotReadyAddresses on that Service.
+By default, nothing. /healthz/ready answers 200 always, and the real state
+rides in the JSON body ("ready", "gates_pod" and the counters) and in the
+dis_sidecar_ready gauge (0/1); the gauge is the alerting signal.
+
+Readiness is per POD, not per container: a sidecar answering 503 to a
+readinessProbe takes the whole pod, the simulator included, out of every
+Service that selects it. A sidecar that cannot hear its simulator should
+raise an alert, not remove the simulator from the network, and a site that
+wired this probe in its own recipe must not have its simulator pulled out
+of its Services by a sidecar's opinion.
+
+READY_GATES_POD=1 restores the gate (503 when not ready) for a pod that has
+no simulator behind a Service, where pulling the pod out is the point.
 
 The window is measured from when the UDP socket opens, not from import;
 see note_started().
@@ -34,10 +41,20 @@ import os
 import threading
 import time
 
+from prometheus_client import Gauge
+
 # Before the simulator is run it emits no entity PDUs. The allowance is how
 # long that is tolerated after the socket opens, and how long a gap in
 # entity PDUs is tolerated after that (see the module note).
 READY_ENTITY_WINDOW_S = float(os.getenv("READY_ENTITY_WINDOW_S", "90"))
+
+# 1 restores the old gate: /healthz/ready answers 503 when not ready.
+READY_GATES_POD = os.getenv("READY_GATES_POD", "0").strip() == "1"
+
+DIS_SIDECAR_READY = Gauge(
+    "dis_sidecar_ready",
+    "1 when the readiness condition holds (see ready.py), else 0. The "
+    "alerting signal; /healthz/ready no longer gates the pod by default.")
 
 _lock = threading.Lock()
 _started = time.monotonic()
@@ -64,6 +81,7 @@ def note_entity() -> None:
     with _lock:
         _entity_count += 1
         _last_entity = time.monotonic()
+    DIS_SIDECAR_READY.set(1)        # an accepted ES is, by definition, ready
 
 
 def readiness(now: float, started: float, last_entity: float, count: int, window: float) -> dict:
@@ -82,3 +100,15 @@ def state() -> dict:
     with _lock:
         started, last_entity, count = _started, _last_entity, _entity_count
     return readiness(time.monotonic(), started, last_entity, count, READY_ENTITY_WINDOW_S)
+
+
+def probe() -> tuple[int, dict]:
+    """The /healthz/ready answer: (HTTP status, JSON body).
+
+    Updates the gauge on every call. 200 always unless READY_GATES_POD, in
+    which case 503 when not ready; "gates_pod" in the body says which.
+    """
+    rd = state()
+    DIS_SIDECAR_READY.set(1 if rd["ready"] else 0)
+    rd["gates_pod"] = READY_GATES_POD
+    return (200 if (rd["ready"] or not READY_GATES_POD) else 503), rd

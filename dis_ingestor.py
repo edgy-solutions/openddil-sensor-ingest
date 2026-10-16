@@ -76,6 +76,7 @@ from confluent_kafka import Producer, KafkaError, KafkaException
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_client.exposition import MetricsHandler
 
+import assign
 import ready
 import spool as spool_mod
 import stall
@@ -238,16 +239,35 @@ class DenyFilter:
         return len(self.ids)
 
 
-def _entity_drop_reason(admitted) -> str:  # noqa: ANN001
-    """Counter label for an entity-filter drop: admit list or deny list."""
+def _entity_drop_reason(admitted, urn: str) -> str:  # noqa: ANN001
+    """Counter label for an entity-filter drop: admit list, deny list, or
+    assignment rules (which say whether the URN belongs elsewhere or is not
+    yet decided, hence the URN)."""
+    if isinstance(admitted, assign.AssignmentFilter):
+        return admitted.drop_reason(urn)
     return "entity_denied" if isinstance(admitted, DenyFilter) else "entity"
 
 
-def _build_entity_filter(admit_raw: str, deny_raw: str):  # noqa: ANN201
-    """Admit list -> frozenset, deny list -> DenyFilter, neither -> None.
-    Both set is fatal: one sidecar has one rule."""
+def _build_entity_filter(admit_raw: str, deny_raw: str,  # noqa: ANN201
+                         rules_raw: str = "", fallback_raw: str = ""):
+    """Admit list -> frozenset, deny list -> DenyFilter, assignment rules ->
+    AssignmentFilter, none -> None. More than one is fatal: one sidecar has
+    one rule."""
     admit = _parse_entity_id_list(admit_raw, "DIS_ADMITTED_ENTITY_IDS")
     deny = _parse_entity_id_list(deny_raw, "DIS_DENIED_ENTITY_IDS")
+    if rules_raw.strip():
+        if admit is not None or deny is not None:
+            logger.critical(
+                "DIS_ASSIGNMENT_RULES is set together with "
+                "DIS_ADMITTED_ENTITY_IDS or DIS_DENIED_ENTITY_IDS -- one "
+                "sidecar has one rule. Refusing to start.")
+            sys.exit(1)
+        try:
+            return assign.parse_assignment_rules(
+                rules_raw, OPENDDIL_EDGE_ID, fallback_raw.strip())
+        except ValueError as exc:
+            logger.critical("DIS_ASSIGNMENT_RULES: %s. Refusing to start.", exc)
+            sys.exit(1)
     if admit is not None and deny is not None:
         logger.critical(
             "DIS_ADMITTED_ENTITY_IDS and DIS_DENIED_ENTITY_IDS are both set "
@@ -256,22 +276,26 @@ def _build_entity_filter(admit_raw: str, deny_raw: str):  # noqa: ANN201
     return DenyFilter(deny) if deny is not None else admit
 
 
-def _parse_non_asset_sources(raw: str) -> frozenset[tuple[int, int, int | None]]:
+def _parse_non_asset_sources(raw: str) -> frozenset[tuple[int | None, int, int | None]]:
     """DIS_NON_ASSET_SOURCES: `site:app` or `site:app:kind`, comma/whitespace
-    separated. Fails closed on a malformed or duplicate entry."""
-    out: set[tuple[int, int, int | None]] = set()
+    separated; `*` for the site means any site. Fails closed on a malformed
+    or duplicate entry. `*:5` and `1:5` are different entries and may be
+    listed together."""
+    out: set[tuple[int | None, int, int | None]] = set()
     for token in (t for t in re.split(r"[\s,]+", raw.strip()) if t):
-        m = re.fullmatch(r"(\d+):(\d+)(?::(\d+))?", token)
+        m = re.fullmatch(r"(\d+|\*):(\d+)(?::(\d+))?", token)
         ok = m is not None
         if ok:
-            site, app = int(m.group(1)), int(m.group(2))
+            site = None if m.group(1) == "*" else int(m.group(1))
+            app = int(m.group(2))
             kind = int(m.group(3)) if m.group(3) is not None else None
-            ok = site <= 65535 and app <= 65535 and (kind is None or kind <= 255)
+            ok = ((site is None or site <= 65535) and app <= 65535
+                  and (kind is None or kind <= 255))
         if not ok:
             logger.critical(
                 "DIS_NON_ASSET_SOURCES: malformed source %r -- expected "
                 "<site>:<app> or <site>:<app>:<kind> (site/app 0..65535, "
-                "kind 0..255). Refusing to start.", token)
+                "kind 0..255; site may be * for any site). Refusing to start.", token)
             sys.exit(1)
         if (site, app, kind) in out:
             logger.critical(
@@ -282,16 +306,31 @@ def _parse_non_asset_sources(raw: str) -> frozenset[tuple[int, int, int | None]]
     return frozenset(out)
 
 
-def _format_source(src: tuple[int, int, int | None]) -> str:
-    return ":".join(str(x) for x in src if x is not None)
+def _format_source(src: tuple[int | None, int, int | None]) -> str:
+    return ":".join("*" if i == 0 and x is None else str(x)
+                    for i, x in enumerate(src) if i == 0 or x is not None)
 
 
 DIS_ADMITTED_ENTITY_IDS = _build_entity_filter(
     os.getenv("DIS_ADMITTED_ENTITY_IDS", ""),
-    os.getenv("DIS_DENIED_ENTITY_IDS", ""))
+    os.getenv("DIS_DENIED_ENTITY_IDS", ""),
+    os.getenv("DIS_ASSIGNMENT_RULES", ""),
+    os.getenv("DIS_FALLBACK_EDGE", ""))
 
-DIS_NON_ASSET_SOURCES: frozenset[tuple[int, int, int | None]] = (
+DIS_NON_ASSET_SOURCES: frozenset[tuple[int | None, int, int | None]] = (
     _parse_non_asset_sources(os.getenv("DIS_NON_ASSET_SOURCES", "")))
+
+
+def _build_nation_stamper(raw: str):  # noqa: ANN201
+    """DIS_NATION_RULES -> NationStamper or None; a bad value is fatal."""
+    try:
+        return assign.parse_nation_rules(raw)
+    except ValueError as exc:
+        logger.critical("DIS_NATION_RULES: %s. Refusing to start.", exc)
+        sys.exit(1)
+
+
+DIS_NATION_STAMPER = _build_nation_stamper(os.getenv("DIS_NATION_RULES", ""))
 
 
 def _parse_munition_claim_ttl(raw: str) -> float:
@@ -705,7 +744,7 @@ def _accept_emission(
     if _source_dropped(pdu.emittingEntityID):
         return False
     if not _entity_admitted(pdu.emittingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, _entity_urn(pdu.emittingEntityID))).inc()
         return False
     return True
 
@@ -722,7 +761,7 @@ def _accept_data(
     if _source_dropped(pdu.originatingEntityID):
         return False
     if not _entity_admitted(pdu.originatingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, _entity_urn(pdu.originatingEntityID))).inc()
         return False
     return True
 
@@ -769,6 +808,52 @@ def _handle_data(
     return True
 
 
+def _decode_marking(pdu) -> str:  # noqa: ANN001
+    """The Entity State marking as text; "" when absent or undecodable."""
+    marking_raw = getattr(pdu, "marking", None)
+    if marking_raw is None:
+        return ""
+    try:
+        return bytes(marking_raw.characters).rstrip(b"\x00").decode("ascii", errors="replace")
+    except Exception:
+        return ""
+
+
+def _stamp_nation(payload: dict, stamper) -> None:  # noqa: ANN001
+    """Stamp `stamped_nation` into the record's origin block (DIS_NATION_RULES).
+
+    Entity State records carry it under `origin_node`; Remove, Fire,
+    Detonation and Event Report under `provenance`. The key is OMITTED when
+    there is no nation -- never null, because a null would read downstream
+    as a claim. Keyed on the entity the record is about: the launcher for
+    Fire and Detonation, the receiving entity for Remove, the originating
+    entity for Event Report. Resupply Received is not stamped. An Entity
+    State record is also what feeds the stamper its facts.
+    """
+    if stamper is None:
+        return
+    pdu_type = payload.get("pdu_type")
+    if "origin_node" in payload:
+        loc = payload["location_ecef"]
+        nation = stamper.observe_entity_state(
+            payload["entity_id_urn"], int(payload["dis_entity_type"]["kind"]),
+            payload["marking"], int(payload["dis_entity_type"]["country"]),
+            (loc["x"], loc["y"], loc["z"]))
+        block = payload["origin_node"]
+    elif pdu_type in ("fire", "detonation"):
+        nation = stamper.nation_for(payload["launcher_urn"])
+        block = payload.setdefault("provenance", {})
+    elif pdu_type in ("remove_entity", "event_report"):
+        nation = stamper.nation_for(payload["entity_id_urn"])
+        block = payload.setdefault("provenance", {})
+    else:
+        return
+    if nation is not None:
+        block["stamped_nation"] = nation
+    elif not block:
+        payload.pop("provenance", None)       # an empty block we created
+
+
 def _extract_entity_state(pdu: EntityStatePdu, raw_size: int,  # noqa: ANN001
                           zero_is_claim: bool = False) -> dict:
     """
@@ -784,15 +869,7 @@ def _extract_entity_state(pdu: EntityStatePdu, raw_size: int,  # noqa: ANN001
     loc   = pdu.entityLocation
     vel   = pdu.entityLinearVelocity
     orient = pdu.entityOrientation
-    marking_raw = getattr(pdu, "marking", None)
-
-    if marking_raw is not None:
-        try:
-            marking = bytes(marking_raw.characters).rstrip(b"\x00").decode("ascii", errors="replace")
-        except Exception:
-            marking = ""
-    else:
-        marking = ""
+    marking = _decode_marking(pdu)
 
     entity_id_urn = f"dis:{eid.siteID}:{eid.applicationID}:{eid.entityID}"
 
@@ -1073,8 +1150,13 @@ def _non_asset_source(site: int, app: int, kind: int | None = None) -> bool:
     """
     if not DIS_NON_ASSET_SOURCES:
         return False
-    return ((site, app, None) in DIS_NON_ASSET_SOURCES
-            or (kind is not None and (site, app, kind) in DIS_NON_ASSET_SOURCES))
+    # A `*` site entry (stored with site None) matches any site.
+    for s in (site, None):
+        if (s, app, None) in DIS_NON_ASSET_SOURCES:
+            return True
+        if kind is not None and (s, app, kind) in DIS_NON_ASSET_SOURCES:
+            return True
+    return False
 
 
 def _source_dropped(entity_id, kind: int | None = None) -> bool:  # noqa: ANN001
@@ -1304,12 +1386,12 @@ def _serve_http() -> None:
                 self.wfile.write(body)
                 return
             if self.path.startswith("/healthz/ready"):
-                rd = ready.state()
+                status, rd = ready.probe()
                 body = json.dumps(rd).encode()
-                # 503 here is what pulls the pod out of the Service's
-                # endpoints -- unlike /healthz/live's 503, which triggers a
-                # kubelet restart.
-                self.send_response(200 if rd["ready"] else 503)
+                # 200 always unless READY_GATES_POD=1, when 503 pulls the pod
+                # out of the Service's endpoints (unlike /healthz/live's 503,
+                # which triggers a kubelet restart). See ready.py.
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -1377,6 +1459,14 @@ def _accept_entity_state(
         return False
     if _source_dropped(pdu.entityID, int(pdu.entityType.entityKind)):
         return False
+    if isinstance(admitted, assign.AssignmentFilter):
+        # Decide this URN from the facts this Entity State carries, before
+        # the admit test reads the decision. Sticky: later ES do not move it.
+        loc = pdu.entityLocation
+        admitted.observe_entity_state(
+            _entity_urn(pdu.entityID), int(pdu.entityType.entityKind),
+            _decode_marking(pdu), int(pdu.entityType.country),
+            (loc.x, loc.y, loc.z))
     if not _entity_admitted(pdu.entityID, admitted):
         # A claimed munition is admitted and its claim refreshed, but it is
         # not "a platform of mine is alive", so readiness is not touched.
@@ -1388,7 +1478,7 @@ def _accept_entity_state(
             return True
         reason = ("munition_unclaimed"
                   if int(pdu.entityType.entityKind) != 1
-                  else _entity_drop_reason(admitted))
+                  else _entity_drop_reason(admitted, urn))
         DIS_PDUS_FILTERED.labels(reason=reason).inc()
         return False
     stall.note_input()
@@ -1418,7 +1508,7 @@ def _accept_remove_entity(
     if _source_dropped(pdu.receivingEntityID):
         return False
     if not _entity_admitted(pdu.receivingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, _entity_urn(pdu.receivingEntityID))).inc()
         return False
     return True
 
@@ -1441,7 +1531,7 @@ def _accept_effector(
     if _source_dropped(pdu.firingEntityID):
         return False
     if not _entity_admitted(pdu.firingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, _entity_urn(pdu.firingEntityID))).inc()
         return False
     return True
 
@@ -1465,7 +1555,7 @@ def _accept_resupply_received(
         DIS_PDUS_FILTERED.labels(reason="non_asset_source").inc()
         return False
     if admitted is not None and urn not in admitted:
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, urn)).inc()
         return False
     return True
 
@@ -1488,7 +1578,7 @@ def _accept_event_report(
     if _source_dropped(pdu.originatingEntityID):
         return False
     if not _entity_admitted(pdu.originatingEntityID, admitted):
-        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted)).inc()
+        DIS_PDUS_FILTERED.labels(reason=_entity_drop_reason(admitted, _entity_urn(pdu.originatingEntityID))).inc()
         return False
     return True
 
@@ -1562,6 +1652,8 @@ def run():
 
     if DIS_ADMITTED_ENTITY_IDS is None:
         logger.info("Entity filter: OFF")
+    elif isinstance(DIS_ADMITTED_ENTITY_IDS, assign.AssignmentFilter):
+        DIS_ADMITTED_ENTITY_IDS.log_summary(logger)
     elif isinstance(DIS_ADMITTED_ENTITY_IDS, DenyFilter):
         logger.info("Entity filter: DENY %d ids (fallback edge) -- %s",
                     len(DIS_ADMITTED_ENTITY_IDS),
@@ -1574,7 +1666,8 @@ def run():
         logger.info("Non-asset sources: %d -- %s", len(DIS_NON_ASSET_SOURCES),
                     ", ".join(_format_source(x) for x in sorted(
                         DIS_NON_ASSET_SOURCES,
-                        key=lambda t: (t[0], t[1], -1 if t[2] is None else t[2]))))
+                        key=lambda t: (-1 if t[0] is None else t[0], t[1],
+                                       -1 if t[2] is None else t[2]))))
 
     try:
         stall_watch = None
@@ -1685,6 +1778,7 @@ def run():
                         DIS_DECODE_ERRORS.inc()
                         logger.warning("Field extraction error from %s: %s", addr, exc)
                         continue
+                    _stamp_nation(payload, DIS_NATION_STAMPER)
 
                 elif pdu_type == 12:
                     if not isinstance(pdu, RemoveEntityPdu):
@@ -1736,6 +1830,7 @@ def run():
                         DIS_DECODE_ERRORS.inc()
                         logger.warning("Field extraction error from %s: %s", addr, exc)
                         continue
+                    _stamp_nation(payload, DIS_NATION_STAMPER)
 
                 elif pdu_type in (2, 3):
                     expected_cls = FirePdu if pdu_type == 2 else DetonationPdu
@@ -1766,6 +1861,7 @@ def run():
                         DIS_DECODE_ERRORS.inc()
                         logger.warning("Field extraction error from %s: %s", addr, exc)
                         continue
+                    _stamp_nation(payload, DIS_NATION_STAMPER)
 
                     DIS_EFFECTOR_PDUS_DECODED.labels(pdu_type=payload["pdu_type"]).inc()
 
@@ -1793,6 +1889,7 @@ def run():
                         DIS_DECODE_ERRORS.inc()
                         logger.warning("Field extraction error from %s: %s", addr, exc)
                         continue
+                    _stamp_nation(payload, DIS_NATION_STAMPER)
 
                 elif pdu_type in (20, 23):
                     expected_cls = DataPdu if pdu_type == 20 else ElectromagneticEmissionsPdu
