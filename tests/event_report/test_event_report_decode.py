@@ -20,6 +20,7 @@ import sys
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -27,6 +28,7 @@ from opendis.DataOutputStream import DataOutputStream  # noqa: E402
 from opendis.PduFactory import createPdu  # noqa: E402
 from opendis.dis7 import EventReportPdu, FixedDatum, VariableDatum  # noqa: E402
 
+import assign  # noqa: E402
 import dis_ingestor  # noqa: E402
 
 
@@ -106,6 +108,30 @@ class EventReportDecodeTests(unittest.TestCase):
         self.assertNotIn("appearance", payload)
         self.assertNotIn("location_ecef", payload)
         self.assertNotIn("request_id", payload)
+
+    def test_record_names_the_tier_that_produced_it(self):
+        pdu = _build_event_report_pdu(originating=(1, 1, 1005), receiving=(0, 0, 0),
+                                      event_type=1)
+        with mock.patch.object(dis_ingestor, "OPENDDIL_EDGE_ID", "edge-x"),                 mock.patch.object(dis_ingestor, "OPENDDIL_REGION_ID", "region-y"):
+            payload = dis_ingestor._extract_event_report(createPdu(_serialize(pdu)))
+        self.assertEqual(payload["provenance"],
+                         {"edge_id": "edge-x", "region_id": "region-y"})
+
+    def test_nation_stamp_merges_into_provenance(self):
+        pdu = _build_event_report_pdu(originating=(1, 1, 1005), receiving=(0, 0, 0),
+                                      event_type=1)
+        stamper = assign.parse_nation_rules(
+            '{"overrides": {"dis:1:1:1005": "BDR"}}')
+        with mock.patch.object(dis_ingestor, "OPENDDIL_EDGE_ID", "edge-x"),                 mock.patch.object(dis_ingestor, "OPENDDIL_REGION_ID", "region-y"):
+            stamped = dis_ingestor._extract_event_report(createPdu(_serialize(pdu)))
+            plain = dis_ingestor._extract_event_report(createPdu(_serialize(pdu)))
+        dis_ingestor._stamp_nation(stamped, stamper)
+        dis_ingestor._stamp_nation(plain, None)
+        self.assertEqual(stamped["provenance"], {
+            "edge_id": "edge-x", "region_id": "region-y", "stamped_nation": "BDR"})
+        self.assertEqual(plain["provenance"],
+                         {"edge_id": "edge-x", "region_id": "region-y"})
+
 
     def test_site_filtered_pdu_is_not_a_match(self):
         pdu = _build_event_report_pdu(

@@ -139,7 +139,9 @@ LOG_LEVEL      = os.getenv("LOG_LEVEL",      "INFO").upper()
 # Origin-node provenance (ADR-0022 / ADR-0023). Stamped here, the earliest
 # point in the pipeline that knows where the DIS feed physically lands.
 # Values are deployer-assigned per the topology contract; this just stamps
-# what the deployer told it to.
+# what the deployer told it to. Every record the sidecar publishes carries
+# its producing tier as a declared field: `origin_node` on Entity State,
+# `provenance` on Remove, Fire, Detonation, Resupply Received and Event Report.
 #
 # Sensor-ingest was a pure UDP→Kafka transport, with entity separation left
 # entirely to test-side discipline: the harness sent each range to its own
@@ -1073,6 +1075,12 @@ def _extract_event_report(pdu: "EventReportPdu") -> dict:  # noqa: ANN001,F821
         "fixed_datums": fixed_datums,
         "variable_datums": variable_datums,
         "ingest_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        # Producing tier, declared (see module header): every record this
+        # sidecar publishes names its origin, same shape as Remove/Fire.
+        "provenance": {
+            "edge_id":   OPENDDIL_EDGE_ID,
+            "region_id": OPENDDIL_REGION_ID,
+        },
     }
 
 
